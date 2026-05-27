@@ -1,0 +1,8 @@
+streamlit
+pandas
+openpyxl
+qrcode
+pillow
+faker
+msal
+requests
