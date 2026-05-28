@@ -1,0 +1,16 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Secrets / credentials
+auth_config.py
+.env
+
+# Local data
+data/mock_patients.xlsx
+
+# Mac files
+.DS_Store

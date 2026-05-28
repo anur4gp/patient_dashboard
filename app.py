@@ -4,8 +4,43 @@ from services.excel_backend import ExcelBackend
 from services.patient_service import PatientService
 from services.qr_service import generate_qr
 from services.scan_service import ScanService
+from services.label_service import generate_printable_label
+from services.auth_service import login
 from rapidfuzz import process, fuzz
 from config import COMPARTMENTS
+
+# -----------------------
+# LOGIN STATE
+# -----------------------
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+# -----------------------
+# LOGIN GATE
+# -----------------------
+if not st.session_state.authenticated:
+
+    st.title("🏥 Clinic Patient Dashboard")
+
+    st.subheader("Login")
+
+    username = st.text_input("Username")
+
+    password = st.text_input(
+        "Password",
+        type="password"
+    )
+
+    if st.button("Login"):
+
+        if login(username, password):
+            st.session_state.authenticated = True
+            st.rerun()
+
+        else:
+            st.error("Invalid username or password")
+
+    st.stop()
 
 # init
 backend = ExcelBackend("data/mock_patients.xlsx")
@@ -71,7 +106,15 @@ def fuzzy_search_patients(df, query, limit=10):
     return pd.DataFrame(matched)
 
 
-st.title("Patient Dashboard")
+col1, col2 = st.columns([8, 1])
+
+with col1:
+    st.title("Patient Dashboard")
+
+with col2:
+    if st.button("Exit"):
+        st.session_state.authenticated = False
+        st.rerun()
 
 # tabs
 tab_scan, tab_directory, tab_logs = st.tabs([
@@ -267,8 +310,21 @@ with tab_directory:
                 """)
 
             with col2:
+
                 qr = generate_qr(p["patient_uuid"])
+
                 st.image(qr, width=100)
+
+                if st.button(
+                    "🖨 Print Label",
+                    key=f"print_{p['patient_uuid']}"
+                ):
+                    generate_printable_label(p, qr)
+
+                    st.success(
+                        f"Opened printable label for "
+                        f"{p['first_name']} {p['last_name']}"
+                    )
 
 
 # log tab

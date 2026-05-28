@@ -1,0 +1,51 @@
+
+    <html>
+    <head>
+        <title>Patient QR Label</title>
+
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                text-align: center;
+                padding-top: 50px;
+            }
+
+            img {
+                width: 250px;
+                height: 250px;
+            }
+
+            .name {
+                font-size: 28px;
+                font-weight: bold;
+                margin-top: 20px;
+            }
+
+            .uuid {
+                font-size: 20px;
+                margin-top: 10px;
+            }
+
+            @media print {
+                body {
+                    margin: 0;
+                }
+            }
+        </style>
+    </head>
+
+    <body onload="window.print()">
+
+        <img src="qr_codes/6ec2416d.png" />
+
+        <div class="name">
+            Joel Young
+        </div>
+
+        <div class="uuid">
+            UUID: 6ec2416d
+        </div>
+
+    </body>
+    </html>
+    
