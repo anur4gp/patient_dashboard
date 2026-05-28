@@ -115,7 +115,95 @@ with tab_scan:
 
         patient = df[df["patient_uuid"] == active_id].iloc[0]
 
-        st.json(patient.to_dict())
+        st.subheader("👤 Patient Profile")
+
+        with st.container(border=True):
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                first_name = st.text_input(
+                    "First Name",
+                    value=str(patient.get("first_name", "")),
+                    key=f"fname_{active_id}"
+                )
+
+                last_name = st.text_input(
+                    "Last Name",
+                    value=str(patient.get("last_name", "")),
+                    key=f"lname_{active_id}"
+                )
+
+                dob = st.text_input(
+                    "Date of Birth",
+                    value=str(patient.get("dob", "")),
+                    key=f"dob_{active_id}"
+                )
+
+                sex = st.text_input(
+                    "Sex",
+                    value=str(patient.get("sex", "")),
+                    key=f"sex_{active_id}"
+                )
+
+            with col2:
+
+                phone = st.text_input(
+                    "Phone",
+                    value=str(patient.get("phone", "")),
+                    key=f"phone_{active_id}"
+                )
+
+                provider = st.text_input(
+                    "Provider",
+                    value=str(patient.get("provider", "")),
+                    key=f"provider_{active_id}"
+                )
+
+                insurance = st.text_input(
+                    "Insurance",
+                    value=str(patient.get("insurance", "")),
+                    key=f"insurance_{active_id}"
+                )
+
+                allergies = st.text_area(
+                    "Allergies",
+                    value=str(patient.get("allergies", "")),
+                    key=f"allergy_{active_id}"
+                )
+
+            medications = st.text_area(
+                "Medications",
+                value=str(patient.get("medications", "")),
+                key=f"meds_{active_id}"
+            )
+
+            if st.button("💾 Save Patient Changes",
+                        key=f"save_{active_id}"):
+
+                updated_fields = {
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "dob": dob,
+                    "sex": sex,
+                    "phone": phone,
+                    "provider": provider,
+                    "insurance": insurance,
+                    "allergies": allergies,
+                    "medications": medications
+                }
+
+                sheets = service.update_patient(
+                    sheets,
+                    active_id,
+                    updated_fields
+                )
+
+                backend.write_patients(sheets)
+                refresh_state()
+
+                st.success("Patient updated successfully")
+                st.rerun()
 
         current_loc = patient.get("current_location", "INTAKE")
 

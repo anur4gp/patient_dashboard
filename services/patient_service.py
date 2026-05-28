@@ -31,3 +31,23 @@ class PatientService:
 
         sheets["Patients"] = df
         return sheets
+    
+    def update_patient(self, sheets, patient_uuid, updated_fields):
+
+        df = sheets["Patients"].copy()
+
+        for column, value in updated_fields.items():
+            if column in df.columns:
+                df.loc[
+                    df["patient_uuid"] == patient_uuid,
+                    column
+                ] = value
+
+        df.loc[
+            df["patient_uuid"] == patient_uuid,
+            "last_updated"
+        ] = datetime.now().isoformat()
+
+        sheets["Patients"] = df
+
+        return sheets
