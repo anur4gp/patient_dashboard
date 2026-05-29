@@ -34,7 +34,7 @@ class ClinicSimulator:
     # -------------------------
     def simulate_day(
         self,
-        n_patients=100,
+        n_patients=200,
         start_hour=8,
         end_hour=17
     ):
@@ -167,7 +167,7 @@ class ClinicSimulator:
     def inject_into_workbook(
         self,
         sheets,
-        n_patients=50
+        n_patients=1000
     ):
 
         simulated_logs = self.simulate_day(

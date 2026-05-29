@@ -11,7 +11,7 @@ sim = ClinicSimulator()
 
 sheets = sim.inject_into_workbook(
     sheets,
-    n_patients=100
+    n_patients=1000
 )
 
 backend.write_patients(sheets)
