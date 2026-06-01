@@ -34,7 +34,7 @@ class ClinicSimulator:
     # -------------------------
     def simulate_day(
         self,
-        n_patients=200,
+        n_patients=1000,
         start_hour=8,
         end_hour=17
     ):
