@@ -15,6 +15,7 @@ from services.ode_visualizer import ODEVisualizer
 from services.arrival_model import ArrivalModel
 
 from services.settings_service import SettingsService
+from services.multi_day_simulator import MultiDaySimulator
 
 # getting to login
 if "authenticated" not in st.session_state:
@@ -423,6 +424,58 @@ with tab_forecast:
     st.pyplot(
         visualizer.plot_forecast()
     )
+
+    st.subheader("7-Day Forecast")
+
+    simulator = MultiDaySimulator(
+        sheets=sheets,
+        rates=rates,
+        pharmacy_probability=pharmacy_probability,
+        total_doctors=total_doctors
+    )
+
+    simulations = simulator.simulate_days(
+        n_days=settings["forecast_days"]
+    )
+
+    summary = simulator.summarize(
+        simulations
+    )
+
+    st.pyplot(
+        visualizer.plot_multi_day_forecast(
+            summary,
+            compartment_index=1
+        )
+    )
+
+    peak_waits = simulations[:, 1, :].max(axis=1)
+
+    congestion_probability = (
+        (peak_waits > 15)
+        .mean()
+        * 100
+    )
+
+    st.metric(
+        "Congestion Risk",
+        f"{congestion_probability:.1f}%"
+    )
+
+    if congestion_probability > 70:
+        st.error(
+            "High risk of severe waiting room congestion."
+        )
+
+    elif congestion_probability > 40:
+        st.warning(
+            "Moderate congestion risk."
+        )
+
+    else:
+        st.success(
+            "Clinic flow appears stable."
+        )
 
     # translated alerts
     st.subheader("Operational Alerts")
