@@ -7,52 +7,48 @@ class ClinicODESystem:
     def __init__(
         self,
         rates,
-        pharmacy_probability=0.2,
-        doctors=3
+        arrival_function,
+        total_doctors=4,
+        pharmacy_probability=0.2
     ):
+
+        self.rates = rates
+        self.arrival_function = arrival_function
+        self.total_doctors = total_doctors
+        self.pharmacy_probability = pharmacy_probability
 
         self.gamma_W = rates.get("WAITING", 0.05)
         self.gamma_D = rates.get("DOCTOR", 0.03)
         self.gamma_P = rates.get("PHARMACY", 0.08)
 
+
         self.p = pharmacy_probability
-        self.y = doctors
+        self.y = total_doctors
 
-    # -----------------------------------
-    # Arrival function λ(t)
-    # -----------------------------------
-    def arrival_rate(self, t):
+        self.arrival_function = arrival_function
 
-        # simple time-dependent arrivals
-        # t measured in minutes
+    
 
-        hour = t / 60
-
-        # morning rush
-        if 8 <= hour <= 11:
-            return 4
-
-        # lunch slowdown
-        elif 11 < hour <= 13:
-            return 2
-
-        # afternoon moderate
-        elif 13 < hour <= 17:
-            return 3
-
-        return 0.5
-
-    # -----------------------------------
-    # ODE SYSTEM
-    # -----------------------------------
+    # ode system
     def system(self, t, state):
 
         I, W, D, P, X = state
 
-        lam = self.arrival_rate(t)
+        lam = max(
+            self.arrival_function(t / 60),
+            0
+        )
 
         # nonlinear doctor availability
-        available_doctors = max(self.y - D, 0)
+        available_doctors = max(
+            self.total_doctors - D,
+            0
+        )
+
+        doctor_capacity = min(
+            W,
+            available_doctors
+        )
 
         flow_to_doctor = min(
             W,
@@ -92,9 +88,7 @@ class ClinicODESystem:
             dX
         ]
 
-    # -----------------------------------
-    # SOLVER
-    # -----------------------------------
+    # solve_ivp solver
     def solve(
         self,
         initial_state,

@@ -1,0 +1,8 @@
+{
+    "total_doctors": 6,
+    "doctor_rooms": 6,
+    "pharmacy_capacity": 4,
+    "clinic_open_hour": 8,
+    "clinic_close_hour": 17,
+    "forecast_days": 7
+}

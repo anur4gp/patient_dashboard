@@ -9,15 +9,18 @@ from services.auth_service import login
 from rapidfuzz import process, fuzz
 from config import COMPARTMENTS
 
-# -----------------------
-# LOGIN STATE
-# -----------------------
+from services.parameter_estimator import ParameterEstimator
+from services.clinic_ode import ClinicODESystem
+from services.ode_visualizer import ODEVisualizer
+from services.arrival_model import ArrivalModel
+
+from services.settings_service import SettingsService
+
+# getting to login
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
-# -----------------------
-# LOGIN GATE
-# -----------------------
+# login gate
 if not st.session_state.authenticated:
 
     st.title("🏥 Clinic Patient Dashboard")
@@ -46,6 +49,7 @@ if not st.session_state.authenticated:
 backend = ExcelBackend("data/mock_patients.xlsx")
 service = PatientService(backend)
 scan_service = ScanService(backend)
+settings_service = SettingsService()
 
 # init load state session
 if "df" not in st.session_state or "sheets" not in st.session_state:
@@ -117,13 +121,15 @@ with col2:
         st.rerun()
 
 # tabs
-tab_scan, tab_directory, tab_logs = st.tabs([
+tab_scan, tab_directory, tab_forecast, tab_settings, tab_logs = st.tabs([
     "🔍 Scan",
     "👤 Directory",
+    "📈 Forecast",
+    "⚙️ Settings",
     "📜 Logs"
 ])
 
-# scan tab
+# tab 1: scan
 with tab_scan:
 
     st.subheader("Scan Patient")
@@ -275,7 +281,7 @@ with tab_scan:
             st.rerun()
 
 
-# directory tab
+# tab 2: directory
 with tab_directory:
 
     st.subheader("Patient Search")
@@ -327,7 +333,196 @@ with tab_directory:
                     )
 
 
-# log tab
+# tab 3: operations
+with tab_forecast:
+
+    st.subheader("Clinic Operations Forecast")
+
+    # refresh live data
+    df, sheets = service.get_patients()
+    st.session_state.df = df
+    st.session_state.sheets = sheets
+
+    # load settings
+    settings = settings_service.load_settings()
+
+    total_doctors = settings["total_doctors"]
+
+    # estimate params
+    estimator = ParameterEstimator(sheets)
+
+    rates = estimator.estimate_transition_rates()
+
+    pharmacy_probability = (
+        estimator
+        .estimate_pharmacy_probability()
+    )
+
+    # build arrival function
+    try:
+
+        arrival_model = ArrivalModel(sheets)
+
+        lambda_function = (
+            arrival_model
+            .build_lambda_function()
+        )
+
+    except Exception:
+
+        st.warning(
+            "Not enough historical scan data "
+            "to estimate arrivals yet."
+        )
+
+        lambda_function = (
+            lambda t: 1
+        )
+
+    # build ode
+    ode = ClinicODESystem(
+        rates=rates,
+        arrival_function=lambda_function,
+        pharmacy_probability=pharmacy_probability,
+        total_doctors=total_doctors
+    )
+
+    solution = ode.solve(
+        initial_state=[0, 0, 0, 0, 0],
+        t_end=600
+    )
+
+    visualizer = ODEVisualizer(solution)
+
+    stats = visualizer.summary_stats()
+
+    # metrics
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Peak Waiting Room",
+        stats["peak_waiting"]
+    )
+
+    col2.metric(
+        "Peak Doctor Load",
+        stats["peak_doctor_load"]
+    )
+
+    col3.metric(
+        "Peak Pharmacy",
+        stats["peak_pharmacy"]
+    )
+
+    col4.metric(
+        "Discharged by End",
+        stats["final_discharged"]
+    )
+
+    # forecast plot
+    st.pyplot(
+        visualizer.plot_forecast()
+    )
+
+    # translated alerts
+    st.subheader("Operational Alerts")
+
+    if stats["peak_waiting"] > 20:
+        st.warning(
+            "Heavy waiting room congestion expected."
+        )
+
+    elif stats["peak_waiting"] > 10:
+        st.info(
+            "Moderate waiting room load expected."
+        )
+
+    else:
+        st.success(
+            "Clinic flow appears manageable."
+        )
+
+    if stats["peak_doctor_load"] > total_doctors:
+        st.error(
+            "Doctor bottleneck likely."
+        )
+
+    # staffing context
+    st.caption(
+        f"Forecast based on "
+        f"{total_doctors} total doctors"
+    )
+
+
+# tab 4: settings
+with tab_settings:
+
+    st.subheader("Clinic Configuration")
+
+    settings = (
+        settings_service
+        .load_settings()
+    )
+
+    total_doctors = st.number_input(
+        "Total Doctors",
+        min_value=1,
+        value=settings["total_doctors"]
+    )
+
+    doctor_rooms = st.number_input(
+        "Doctor Rooms",
+        min_value=1,
+        value=settings["doctor_rooms"]
+    )
+
+    pharmacy_capacity = st.number_input(
+        "Pharmacy Capacity",
+        min_value=1,
+        value=settings["pharmacy_capacity"]
+    )
+
+    clinic_open_hour = st.number_input(
+        "Clinic Opening Hour",
+        min_value=0,
+        max_value=23,
+        value=settings["clinic_open_hour"]
+    )
+
+    clinic_close_hour = st.number_input(
+        "Clinic Closing Hour",
+        min_value=1,
+        max_value=24,
+        value=settings["clinic_close_hour"]
+    )
+
+    forecast_days = st.number_input(
+        "Forecast Days",
+        min_value=1,
+        max_value=30,
+        value=settings["forecast_days"]
+    )
+
+    if st.button("Save Settings"):
+
+        new_settings = {
+            "total_doctors": total_doctors,
+            "doctor_rooms": doctor_rooms,
+            "pharmacy_capacity": pharmacy_capacity,
+            "clinic_open_hour": clinic_open_hour,
+            "clinic_close_hour": clinic_close_hour,
+            "forecast_days": forecast_days
+        }
+
+        settings_service.save_settings(
+            new_settings
+        )
+
+        st.success(
+            "Settings updated."
+        )
+
+# tab 5: logs
 with tab_logs:
 
     st.subheader("Event Logs")
