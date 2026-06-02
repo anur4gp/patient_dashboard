@@ -442,10 +442,35 @@ with tab_forecast:
         simulations
     )
 
+    st.subheader(
+        "Multi-Day Compartment Forecast"
+    )
+
+    selected_compartment = st.selectbox(
+        "Select Compartment",
+        [
+            "Intake",
+            "Waiting Room",
+            "Doctor",
+            "Pharmacy",
+            "Discharged"
+        ]
+    )
+
+    compartment_map = {
+        "Intake": 0,
+        "Waiting Room": 1,
+        "Doctor": 2,
+        "Pharmacy": 3,
+        "Discharged": 4
+    }
+
     st.pyplot(
         visualizer.plot_multi_day_forecast(
             summary,
-            compartment_index=1
+            compartment_index=compartment_map[
+                selected_compartment
+            ]
         )
     )
 
@@ -504,6 +529,43 @@ with tab_forecast:
     st.caption(
         f"Forecast based on "
         f"{total_doctors} total doctors"
+    )
+
+    st.subheader(
+        "Forecast Confidence"
+    )
+
+    st.subheader(
+        "Multi-Day Compartment Forecast"
+    )
+
+    selected_compartment = st.selectbox(
+        "Select Compartment",
+        [
+            "Intake",
+            "Waiting Room",
+            "Doctor",
+            "Pharmacy",
+            "Discharged"
+        ],
+        key="forecast_compartment"
+    )
+
+    compartment_map = {
+        "Intake": 0,
+        "Waiting Room": 1,
+        "Doctor": 2,
+        "Pharmacy": 3,
+        "Discharged": 4
+    }
+
+    st.pyplot(
+        visualizer.plot_multi_day_forecast(
+            summary,
+            compartment_index=compartment_map[
+                selected_compartment
+            ]
+        )
     )
 
 
