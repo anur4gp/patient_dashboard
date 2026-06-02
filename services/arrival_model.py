@@ -1,106 +1,102 @@
 import pandas as pd
 import numpy as np
 from scipy.interpolate import CubicSpline
-import random
 
 
 class ArrivalModel:
 
     def __init__(self, sheets):
 
-        self.logs = sheets["ScanLog"].copy()
+        self.sheets = sheets
 
-        self.logs["timestamp"] = pd.to_datetime(
-            self.logs["timestamp"]
-        )
+        if "ScanLog" not in sheets:
+            raise ValueError(
+                "ScanLog missing"
+            )
 
-    def _daily_arrival_curves(self):
-
-        arrivals = self.logs[
-            self.logs["action"] == "SCAN_LOOKUP"
+        self.logs = sheets[
+            "ScanLog"
         ].copy()
-
-        arrivals["date"] = (
-            arrivals["timestamp"]
-            .dt.date
-        )
-
-        daily_curves = []
-
-        for _, group in arrivals.groupby("date"):
-
-            group["minute"] = (
-                group["timestamp"].dt.hour * 60
-                + group["timestamp"].dt.minute
-            )
-
-            bins = np.arange(
-                0,
-                24 * 60 + 60,
-                60
-            )
-
-            counts, edges = np.histogram(
-                group["minute"],
-                bins=bins
-            )
-
-            centers = (
-                edges[:-1]
-                + edges[1:]
-            ) / 2
-
-            spline = CubicSpline(
-                centers,
-                counts,
-                extrapolate=True
-            )
-
-            daily_curves.append(
-                spline
-            )
-
-        return daily_curves
 
     def build_lambda_function(
         self,
-        stochastic=True
+        interval_minutes=30
     ):
+        """
+        Learn time-of-day arrivals
+        from historical scans.
 
-        daily_curves = (
-            self._daily_arrival_curves()
-        )
+        Returns λ(t).
+        """
 
-        if len(daily_curves) == 0:
+        logs = self.logs.copy()
 
-            return lambda t: 1
+        # only patient entry scans
+        logs = logs[
+            logs["action"]
+            == "SCAN_LOOKUP"
+        ]
 
-        if stochastic:
-
-            chosen_curve = random.choice(
-                daily_curves
+        if logs.empty:
+            raise ValueError(
+                "No scan data available"
             )
 
-        else:
+        logs["timestamp"] = pd.to_datetime(
+            logs["timestamp"]
+        )
 
-            def mean_curve(t):
+        # convert timestamps to
+        # minute-of-day
+        logs["minute_of_day"] = (
+            logs["timestamp"].dt.hour * 60
+            +
+            logs["timestamp"].dt.minute
+        )
 
-                vals = [
-                    curve(t)
-                    for curve in daily_curves
-                ]
+        # bucket arrivals
+        bins = np.arange(
+            0,
+            1440 + interval_minutes,
+            interval_minutes
+        )
 
-                return np.mean(vals)
+        counts, edges = np.histogram(
+            logs["minute_of_day"],
+            bins=bins
+        )
 
-            chosen_curve = mean_curve
+        # convert to rate
+        # arrivals per minute
+        rates = (
+            counts
+            / interval_minutes
+        )
+
+        midpoints = (
+            edges[:-1]
+            + interval_minutes / 2
+        )
+
+        # smooth curve
+        spline = CubicSpline(
+            midpoints,
+            rates,
+            bc_type="natural"
+        )
 
         def lambda_function(t):
+            """
+            t in minutes
+            """
 
-            value = chosen_curve(t)
+            t_mod = t % 1440
+
+            value = spline(t_mod)
 
             return max(
-                0,
-                float(value)
+                float(value),
+                0
             )
 
         return lambda_function

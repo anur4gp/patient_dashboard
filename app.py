@@ -17,6 +17,9 @@ from services.arrival_model import ArrivalModel
 from services.settings_service import SettingsService
 from services.multi_day_simulator import MultiDaySimulator
 
+from services.staffing_analyzer import StaffingAnalyzer
+from services.arrival_visualizer import ArrivalVisualizer
+
 # getting to login
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -474,6 +477,39 @@ with tab_forecast:
         )
     )
 
+    # -----------------------------------
+    # ARRIVAL PATTERN LEARNING
+    # -----------------------------------
+    st.subheader(
+        "📥 Learned Patient Arrival Pattern"
+    )
+
+    try:
+
+        arrival_visualizer = (
+            ArrivalVisualizer(
+                lambda_function
+            )
+        )
+
+        st.pyplot(
+            arrival_visualizer
+            .plot_arrivals()
+        )
+
+        st.caption(
+            "Estimated patient arrivals "
+            "learned from historical "
+            "scan timestamps."
+        )
+
+    except Exception:
+
+        st.info(
+            "Not enough scan history "
+            "to learn arrival patterns yet."
+        )
+
     peak_waits = simulations[:, 1, :].max(axis=1)
 
     congestion_probability = (
@@ -504,6 +540,107 @@ with tab_forecast:
 
     # translated alerts
     st.subheader("Operational Alerts")
+
+    # -----------------------------------
+    # STAFFING ANALYSIS
+    # -----------------------------------
+    st.subheader("📋 Operational Recommendations")
+
+    analyzer = StaffingAnalyzer(
+        simulations=simulations,
+        total_doctors=total_doctors
+    )
+
+    # congestion probability
+    congestion_probability_curve = (
+        analyzer.congestion_probability(
+            threshold=15
+        )
+    )
+
+    peak_window = (
+        analyzer
+        .peak_congestion_window()
+    )
+
+    doctor_plan = (
+        analyzer
+        .recommended_doctors()
+    )
+
+    # congestion summary
+    if peak_window:
+
+        start_minute = int(
+            peak_window[0]
+        )
+
+        end_minute = int(
+            peak_window[1]
+        )
+
+        clinic_open = settings[
+            "clinic_open_hour"
+        ]
+
+        start_hour = (
+            clinic_open
+            + start_minute // 60
+        )
+
+        start_remaining = (
+            start_minute % 60
+        )
+
+        end_hour = (
+            clinic_open
+            + end_minute // 60
+        )
+
+        end_remaining = (
+            end_minute % 60
+        )
+
+        st.warning(
+            "High congestion risk detected"
+        )
+
+        st.write(
+            f"**Expected bottleneck window:** "
+            f"{start_hour:02d}:"
+            f"{start_remaining:02d}"
+            f" – "
+            f"{end_hour:02d}:"
+            f"{end_remaining:02d}"
+        )
+
+    else:
+
+        st.success(
+            "No major congestion period predicted."
+        )
+
+    # staffing recommendation
+    if doctor_plan[
+        "additional_needed"
+    ] > 0:
+
+        st.error(
+            f"Recommend adding "
+            f"{doctor_plan['additional_needed']} "
+            f"doctor(s) during peak load."
+        )
+
+    else:
+
+        st.success(
+            "Current staffing appears adequate."
+        )
+
+    st.metric(
+        "Recommended Doctors",
+        doctor_plan["recommended"]
+    )
 
     if stats["peak_waiting"] > 20:
         st.warning(
