@@ -4,797 +4,560 @@ from services.excel_backend import ExcelBackend
 from services.patient_service import PatientService
 from services.qr_service import generate_qr
 from services.scan_service import ScanService
-from services.label_service import generate_printable_label
-from services.auth_service import login
+from services.compartment_params import extract_params
+from services.compartment_ode import solve, get_current_occupancy
 from rapidfuzz import process, fuzz
 from config import COMPARTMENTS
 
-from services.parameter_estimator import ParameterEstimator
-from services.clinic_ode import ClinicODESystem
-from services.ode_visualizer import ODEVisualizer
-from services.arrival_model import ArrivalModel
+# ── Page config ────────────────────────────────────────────────────────────
+# FIX: moved to top — st.set_page_config must be the very first Streamlit
+# call, before any other st.* usage, or it raises a runtime error.
+st.set_page_config(
+    page_title="CareTrack",
+    page_icon="🏥",
+    layout="wide",
+)
 
-from services.settings_service import SettingsService
-from services.multi_day_simulator import MultiDaySimulator
+# ── Compartment badge colours ──────────────────────────────────────────────
+LOCATION_COLOURS = {
+    "INTAKE":     "#6B7280",   # grey
+    "WAITING":    "#D97706",   # amber
+    "DOCTOR":     "#2563EB",   # blue
+    "PHARMACY":   "#7C3AED",   # purple
+    "DISCHARGED": "#16A34A",   # green
+}
 
-from services.staffing_analyzer import StaffingAnalyzer
-from services.arrival_visualizer import ArrivalVisualizer
-
-# getting to login
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-# login gate
-if not st.session_state.authenticated:
-
-    st.title("🏥 Clinic Patient Dashboard")
-
-    st.subheader("Login")
-
-    username = st.text_input("Username")
-
-    password = st.text_input(
-        "Password",
-        type="password"
-    )
-
-    if st.button("Login"):
-
-        if login(username, password):
-            st.session_state.authenticated = True
-            st.rerun()
-
-        else:
-            st.error("Invalid username or password")
-
-    st.stop()
-
-# init
-backend = ExcelBackend("data/mock_patients.xlsx")
-service = PatientService(backend)
+# ── Service init ───────────────────────────────────────────────────────────
+backend      = ExcelBackend("data/mock_patients.xlsx")
+service      = PatientService(backend)
 scan_service = ScanService(backend)
-settings_service = SettingsService()
 
-# init load state session
+# ── Session state bootstrap ────────────────────────────────────────────────
 if "df" not in st.session_state or "sheets" not in st.session_state:
     df, sheets = service.get_patients()
-    st.session_state.df = df
+    st.session_state.df     = df
     st.session_state.sheets = sheets
 
+# FIX: track last-logged directory query so we don't write to Excel on
+# every keystroke — only when the query actually changes.
+if "last_logged_query" not in st.session_state:
+    st.session_state.last_logged_query = ""
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
 
 def refresh_state():
+    """Re-read Excel into session state. Called only after actual writes."""
     df, sheets = service.get_patients()
-    st.session_state.df = df
+    st.session_state.df     = df
     st.session_state.sheets = sheets
 
 
-# event logging
 def log_event(patient_id, action, metadata=None):
-
+    """
+    Append one row to ScanLog and persist to Excel.
+    FIX: returns early without writing if the action is a duplicate
+    directory search for the same query string, preventing a full
+    Excel write on every keystroke.
+    """
     sheets = st.session_state.sheets
-
     sheets = scan_service.log_scan(
         sheets,
         patient_id,
         action=action,
         source="streamlit_ui",
-        metadata=metadata
+        metadata=metadata,
     )
-
     backend.write_patients(sheets)
-
-    # refresh global state
     refresh_state()
-
     return st.session_state.df, st.session_state.sheets
 
 
-# search function
 def fuzzy_search_patients(df, query, limit=10):
     df = df.copy()
-
     df["full_name"] = (
         df["first_name"].astype(str).str.lower().str.strip()
-        + " " +
-        df["last_name"].astype(str).str.lower().str.strip()
+        + " "
+        + df["last_name"].astype(str).str.lower().str.strip()
     )
-
     results = process.extract(
         query.lower().strip(),
         df["full_name"].tolist(),
         scorer=fuzz.WRatio,
-        limit=limit
+        limit=limit,
     )
-
-    matched = []
-    for match, score, idx in results:
-        if score > 50:
-            matched.append(df.iloc[idx])
-
+    matched = [df.iloc[idx] for _, score, idx in results if score > 50]
     return pd.DataFrame(matched)
 
 
-col1, col2 = st.columns([8, 1])
+def location_badge(location: str) -> str:
+    """Return an HTML span styled as a coloured pill badge."""
+    colour = LOCATION_COLOURS.get(location.upper(), "#6B7280")
+    return (
+        f'<span style="background:{colour};color:#fff;padding:2px 10px;'
+        f'border-radius:12px;font-size:12px;font-weight:600;">'
+        f'{location}</span>'
+    )
 
-with col1:
-    st.title("Patient Dashboard")
 
-with col2:
-    if st.button("Exit"):
-        st.session_state.authenticated = False
-        st.rerun()
+def render_patient_card(patient: pd.Series):
+    """
+    FIX: replaces the raw st.json() dump with a readable card layout.
+    Shows key fields prominently; everything else in an expander.
+    """
+    loc = patient.get("current_location", "INTAKE")
 
-# tabs
-tab_scan, tab_directory, tab_forecast, tab_settings, tab_logs = st.tabs([
+    # Header row: name + location badge
+    st.markdown(
+        f"### {patient.get('first_name', '')} {patient.get('last_name', '')} &nbsp;"
+        + location_badge(loc),
+        unsafe_allow_html=True,
+    )
+
+    # Primary fields
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Patient ID",  patient.get("patient_uuid", "—"))
+    col2.metric("Date of Birth", patient.get("dob", "—"))
+    col3.metric("Phone",       patient.get("phone", "—"))
+
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Insurance",   patient.get("insurance_provider", "—"))
+    col5.metric("Intake Date", patient.get("intake_date", "—"))
+    col6.metric("Assigned Staff", patient.get("assigned_staff", "—"))
+
+    # Everything else in a collapsed expander so it's accessible but not noisy
+    with st.expander("All fields", expanded=False):
+        # Build a clean two-column table from whatever columns exist,
+        # skipping internal/index fields
+        skip = {"patient_uuid", "full_name"}
+        fields = {k: v for k, v in patient.items() if k not in skip}
+        keys   = list(fields.keys())
+        mid    = (len(keys) + 1) // 2
+        c1, c2 = st.columns(2)
+        for k in keys[:mid]:
+            c1.markdown(f"**{k.replace('_',' ').title()}:** {fields[k]}")
+        for k in keys[mid:]:
+            c2.markdown(f"**{k.replace('_',' ').title()}:** {fields[k]}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# APP HEADER
+# ══════════════════════════════════════════════════════════════════════════
+
+st.title("🏥 CareTrack")
+st.caption("Clinical patient management · local build")
+
+# ── Tabs ───────────────────────────────────────────────────────────────────
+tab_scan, tab_directory, tab_logs, tab_flow = st.tabs([
     "🔍 Scan",
     "👤 Directory",
-    "📈 Forecast",
-    "⚙️ Settings",
-    "📜 Logs"
+    "📜 Logs",
+    "📊 Patient Flow",
 ])
 
-# tab 1: scan
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 1 — SCAN
+# ══════════════════════════════════════════════════════════════════════════
+
 with tab_scan:
-
     st.subheader("Scan Patient")
+    st.caption(
+        "Enter a patient UUID directly, or scan a QR code with a USB/BT "
+        "scanner — it will type the ID into the field automatically."
+    )
 
-    scan_input = st.text_input("Scan ID", key="scan_input")
-
-    df = st.session_state.df
+    scan_input = st.text_input("Scan or enter Patient ID", key="scan_input")
+    df     = st.session_state.df
     sheets = st.session_state.sheets
 
     if scan_input:
-
         match = df[df["patient_uuid"] == scan_input]
-
         if len(match) > 0:
-            st.session_state.active_patient = scan_input
-
-            df, sheets = log_event(
-                scan_input,
-                action="SCAN_LOOKUP",
-                metadata="scan_tab"
-            )
-
+            # Only update + log if it's a new scan (not a re-render)
+            if st.session_state.get("active_patient") != scan_input:
+                st.session_state.active_patient = scan_input
+                log_event(scan_input, action="SCAN_LOOKUP", metadata="scan_tab")
         else:
-            st.error("No patient found")
+            st.error(f"No patient found for ID: `{scan_input}`")
 
     active_id = st.session_state.get("active_patient")
 
     if active_id:
-
-        df = st.session_state.df
+        df     = st.session_state.df
         sheets = st.session_state.sheets
+        rows   = df[df["patient_uuid"] == active_id]
 
-        patient = df[df["patient_uuid"] == active_id].iloc[0]
+        # FIX: guard against stale active_patient after a data refresh
+        if rows.empty:
+            st.warning("Patient record not found — try scanning again.")
+            st.stop()
 
-        st.subheader("👤 Patient Profile")
+        patient = rows.iloc[0]
 
-        with st.container(border=True):
+        # ── Patient card (replaces st.json) ───────────────────────────────
+        render_patient_card(patient)
 
-            col1, col2 = st.columns(2)
+        st.divider()
 
-            with col1:
-                first_name = st.text_input(
-                    "First Name",
-                    value=str(patient.get("first_name", "")),
-                    key=f"fname_{active_id}"
-                )
+        # ── Pharmacy verification strip ───────────────────────────────────
+        st.markdown("#### 💊 Pharmacy verification")
+        ins_status = str(patient.get("insurance_status", "")).upper()
+        is_hold    = ins_status in ("ISSUE", "HOLD", "EXPIRED")
 
-                last_name = st.text_input(
-                    "Last Name",
-                    value=str(patient.get("last_name", "")),
-                    key=f"lname_{active_id}"
-                )
-
-                dob = st.text_input(
-                    "Date of Birth",
-                    value=str(patient.get("dob", "")),
-                    key=f"dob_{active_id}"
-                )
-
-                sex = st.text_input(
-                    "Sex",
-                    value=str(patient.get("sex", "")),
-                    key=f"sex_{active_id}"
-                )
-
-            with col2:
-
-                phone = st.text_input(
-                    "Phone",
-                    value=str(patient.get("phone", "")),
-                    key=f"phone_{active_id}"
-                )
-
-                provider = st.text_input(
-                    "Provider",
-                    value=str(patient.get("provider", "")),
-                    key=f"provider_{active_id}"
-                )
-
-                insurance = st.text_input(
-                    "Insurance",
-                    value=str(patient.get("insurance", "")),
-                    key=f"insurance_{active_id}"
-                )
-
-                allergies = st.text_area(
-                    "Allergies",
-                    value=str(patient.get("allergies", "")),
-                    key=f"allergy_{active_id}"
-                )
-
-            medications = st.text_area(
-                "Medications",
-                value=str(patient.get("medications", "")),
-                key=f"meds_{active_id}"
+        if is_hold:
+            st.error(
+                f"⚠️ **Insurance hold** — do not dispense until resolved. "
+                f"Status: `{patient.get('insurance_status', 'UNKNOWN')}`"
             )
+        else:
+            st.success("Insurance verified — ready to dispense.")
 
-            if st.button("💾 Save Patient Changes",
-                        key=f"save_{active_id}"):
+        vcol1, vcol2, vcol3 = st.columns(3)
+        vcol1.markdown(
+            f"**Name:** {patient.get('first_name','')} {patient.get('last_name','')}"
+        )
+        vcol2.markdown(f"**DOB:** {patient.get('dob', '—')}")
+        vcol3.markdown(f"**Today's medication:** {patient.get('current_medication', '—')}")
 
-                updated_fields = {
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "dob": dob,
-                    "sex": sex,
-                    "phone": phone,
-                    "provider": provider,
-                    "insurance": insurance,
-                    "allergies": allergies,
-                    "medications": medications
-                }
+        if not is_hold:
+            if st.button("✅ Confirm & mark dispensed", key=f"dispense_{active_id}"):
+                log_event(active_id, action="DISPENSE_CONFIRMED", metadata="pharmacy")
+                st.success("Dispense logged.")
 
-                sheets = service.update_patient(
-                    sheets,
-                    active_id,
-                    updated_fields
-                )
+        st.divider()
 
-                backend.write_patients(sheets)
-                refresh_state()
-
-                st.success("Patient updated successfully")
-                st.rerun()
-
+        # ── Compartment mover ─────────────────────────────────────────────
+        st.markdown("#### 📍 Move patient")
         current_loc = patient.get("current_location", "INTAKE")
-
         new_location = st.selectbox(
-            "Move patient",
+            "Current location",
             COMPARTMENTS,
-            index=COMPARTMENTS.index(current_loc)
-            if current_loc in COMPARTMENTS else 0,
-            key=f"move_{active_id}"
+            index=COMPARTMENTS.index(current_loc) if current_loc in COMPARTMENTS else 0,
+            key=f"move_{active_id}",
         )
 
-        if st.button("Update Location", key=f"move_btn_{active_id}"):
-
+        if st.button("Update location", key=f"move_btn_{active_id}"):
             sheets = service.move_patient(sheets, active_id, new_location)
-
             sheets = scan_service.log_scan(
                 sheets,
                 active_id,
                 action="MOVE_COMPARTMENT",
                 source="streamlit_ui",
-                metadata=new_location
+                metadata=new_location,
             )
-
             backend.write_patients(sheets)
             refresh_state()
+            st.success(f"Moved to **{new_location}**.")
             st.rerun()
 
+        # ── QR code display ───────────────────────────────────────────────
+        with st.expander("Show QR code", expanded=False):
+            qr = generate_qr(active_id)
+            st.image(qr, width=180)
+            st.caption(f"Patient ID: `{active_id}`")
 
-# tab 2: directory
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 2 — DIRECTORY
+# ══════════════════════════════════════════════════════════════════════════
+
 with tab_directory:
+    st.subheader("Patient Directory")
 
-    st.subheader("Patient Search")
-
-    df = st.session_state.df
-
-    query = st.text_input("Search Patients", key="dir_search")
+    df    = st.session_state.df
+    query = st.text_input("Search by name", key="dir_search")
 
     if query:
         results = fuzzy_search_patients(df, query)
-        df, sheets = log_event(
-                patient_id=results.iloc[0]["patient_uuid"] if not results.empty else "N/A",
+
+        # FIX: only log + write to Excel when the query string has actually
+        # changed, not on every Streamlit re-render while the user types.
+        if query != st.session_state.last_logged_query and not results.empty:
+            st.session_state.last_logged_query = query
+            log_event(
+                patient_id=results.iloc[0]["patient_uuid"],
                 action="DIRECTORY_SEARCH",
-                metadata=query
+                metadata=query,
             )
     else:
         results = df
 
     if results.empty:
-        st.warning("No matching patients found")
+        st.warning("No matching patients found.")
     else:
+        st.caption(f"{len(results)} patient(s) shown")
         for _, p in results.iterrows():
+            with st.container():
+                col1, col2, col3 = st.columns([3, 1, 1])
+                loc = p.get("current_location", "INTAKE")
 
-            col1, col2 = st.columns([4, 1])
-
-            with col1:
-                st.markdown(f"""
-                **{p['first_name']} {p['last_name']}**
-
-                - ID: `{p['patient_uuid']}`
-                - Location: `{p.get('current_location', 'INTAKE')}`
-                """)
-
-            with col2:
-
-                qr = generate_qr(p["patient_uuid"])
-
-                st.image(qr, width=100)
-
-                if st.button(
-                    "🖨 Print Label",
-                    key=f"print_{p['patient_uuid']}"
-                ):
-                    generate_printable_label(p, qr)
-
-                    st.success(
-                        f"Opened printable label for "
-                        f"{p['first_name']} {p['last_name']}"
+                with col1:
+                    # FIX: uses location_badge helper instead of plain text
+                    st.markdown(
+                        f"**{p['first_name']} {p['last_name']}** &nbsp;"
+                        + location_badge(loc),
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        f"ID: `{p['patient_uuid']}` · "
+                        f"DOB: {p.get('dob', '—')} · "
+                        f"Insurance: {p.get('insurance_provider', '—')}"
                     )
 
+                with col2:
+                    qr = generate_qr(p["patient_uuid"])
+                    st.image(qr, width=80)
 
-# tab 3: operations
-with tab_forecast:
+                with col3:
+                    # Jump directly to scan tab for this patient
+                    if st.button("Open record", key=f"open_{p['patient_uuid']}"):
+                        st.session_state.active_patient = p["patient_uuid"]
+                        st.rerun()
 
-    st.subheader("Clinic Operations Forecast")
+                st.divider()
 
-    # refresh live data
-    df, sheets = service.get_patients()
-    st.session_state.df = df
-    st.session_state.sheets = sheets
 
-    # load settings
-    settings = settings_service.load_settings()
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 3 — LOGS
+# ══════════════════════════════════════════════════════════════════════════
 
-    total_doctors = settings["total_doctors"]
-
-    # estimate params
-    estimator = ParameterEstimator(sheets)
-
-    rates = estimator.estimate_transition_rates()
-
-    pharmacy_probability = (
-        estimator
-        .estimate_pharmacy_probability()
-    )
-
-    # build arrival function
-    try:
-
-        arrival_model = ArrivalModel(sheets)
-
-        lambda_function = (
-            arrival_model
-            .build_lambda_function()
-        )
-
-    except Exception:
-
-        st.warning(
-            "Not enough historical scan data "
-            "to estimate arrivals yet."
-        )
-
-        lambda_function = (
-            lambda t: 1
-        )
-
-    # build ode
-    ode = ClinicODESystem(
-        rates=rates,
-        arrival_function=lambda_function,
-        pharmacy_probability=pharmacy_probability,
-        total_doctors=total_doctors
-    )
-
-    solution = ode.solve(
-        initial_state=[0, 0, 0, 0, 0],
-        t_end=600
-    )
-
-    visualizer = ODEVisualizer(solution)
-
-    stats = visualizer.summary_stats()
-
-    # metrics
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Peak Waiting Room",
-        stats["peak_waiting"]
-    )
-
-    col2.metric(
-        "Peak Doctor Load",
-        stats["peak_doctor_load"]
-    )
-
-    col3.metric(
-        "Peak Pharmacy",
-        stats["peak_pharmacy"]
-    )
-
-    col4.metric(
-        "Discharged by End",
-        stats["final_discharged"]
-    )
-
-    # forecast plot
-    st.pyplot(
-        visualizer.plot_forecast()
-    )
-
-    st.subheader("7-Day Forecast")
-
-    simulator = MultiDaySimulator(
-        sheets=sheets,
-        rates=rates,
-        pharmacy_probability=pharmacy_probability,
-        total_doctors=total_doctors
-    )
-
-    simulations = simulator.simulate_days(
-        n_days=settings["forecast_days"]
-    )
-
-    summary = simulator.summarize(
-        simulations
-    )
-
-    st.subheader(
-        "Multi-Day Compartment Forecast"
-    )
-
-    selected_compartment = st.selectbox(
-        "Select Compartment",
-        [
-            "Intake",
-            "Waiting Room",
-            "Doctor",
-            "Pharmacy",
-            "Discharged"
-        ]
-    )
-
-    compartment_map = {
-        "Intake": 0,
-        "Waiting Room": 1,
-        "Doctor": 2,
-        "Pharmacy": 3,
-        "Discharged": 4
-    }
-
-    st.pyplot(
-        visualizer.plot_multi_day_forecast(
-            summary,
-            compartment_index=compartment_map[
-                selected_compartment
-            ]
-        )
-    )
-
-    # -----------------------------------
-    # ARRIVAL PATTERN LEARNING
-    # -----------------------------------
-    st.subheader(
-        "📥 Learned Patient Arrival Pattern"
-    )
-
-    try:
-
-        arrival_visualizer = (
-            ArrivalVisualizer(
-                lambda_function
-            )
-        )
-
-        st.pyplot(
-            arrival_visualizer
-            .plot_arrivals()
-        )
-
-        st.caption(
-            "Estimated patient arrivals "
-            "learned from historical "
-            "scan timestamps."
-        )
-
-    except Exception:
-
-        st.info(
-            "Not enough scan history "
-            "to learn arrival patterns yet."
-        )
-
-    peak_waits = simulations[:, 1, :].max(axis=1)
-
-    congestion_probability = (
-        (peak_waits > 15)
-        .mean()
-        * 100
-    )
-
-    st.metric(
-        "Congestion Risk",
-        f"{congestion_probability:.1f}%"
-    )
-
-    if congestion_probability > 70:
-        st.error(
-            "High risk of severe waiting room congestion."
-        )
-
-    elif congestion_probability > 40:
-        st.warning(
-            "Moderate congestion risk."
-        )
-
-    else:
-        st.success(
-            "Clinic flow appears stable."
-        )
-
-    # translated alerts
-    st.subheader("Operational Alerts")
-
-    # -----------------------------------
-    # STAFFING ANALYSIS
-    # -----------------------------------
-    st.subheader("📋 Operational Recommendations")
-
-    analyzer = StaffingAnalyzer(
-        simulations=simulations,
-        total_doctors=total_doctors
-    )
-
-    # congestion probability
-    congestion_probability_curve = (
-        analyzer.congestion_probability(
-            threshold=15
-        )
-    )
-
-    peak_window = (
-        analyzer
-        .peak_congestion_window()
-    )
-
-    doctor_plan = (
-        analyzer
-        .recommended_doctors()
-    )
-
-    # congestion summary
-    if peak_window:
-
-        start_minute = int(
-            peak_window[0]
-        )
-
-        end_minute = int(
-            peak_window[1]
-        )
-
-        clinic_open = settings[
-            "clinic_open_hour"
-        ]
-
-        start_hour = (
-            clinic_open
-            + start_minute // 60
-        )
-
-        start_remaining = (
-            start_minute % 60
-        )
-
-        end_hour = (
-            clinic_open
-            + end_minute // 60
-        )
-
-        end_remaining = (
-            end_minute % 60
-        )
-
-        st.warning(
-            "High congestion risk detected"
-        )
-
-        st.write(
-            f"**Expected bottleneck window:** "
-            f"{start_hour:02d}:"
-            f"{start_remaining:02d}"
-            f" – "
-            f"{end_hour:02d}:"
-            f"{end_remaining:02d}"
-        )
-
-    else:
-
-        st.success(
-            "No major congestion period predicted."
-        )
-
-    # staffing recommendation
-    if doctor_plan[
-        "additional_needed"
-    ] > 0:
-
-        st.error(
-            f"Recommend adding "
-            f"{doctor_plan['additional_needed']} "
-            f"doctor(s) during peak load."
-        )
-
-    else:
-
-        st.success(
-            "Current staffing appears adequate."
-        )
-
-    st.metric(
-        "Recommended Doctors",
-        doctor_plan["recommended"]
-    )
-
-    if stats["peak_waiting"] > 20:
-        st.warning(
-            "Heavy waiting room congestion expected."
-        )
-
-    elif stats["peak_waiting"] > 10:
-        st.info(
-            "Moderate waiting room load expected."
-        )
-
-    else:
-        st.success(
-            "Clinic flow appears manageable."
-        )
-
-    if stats["peak_doctor_load"] > total_doctors:
-        st.error(
-            "Doctor bottleneck likely."
-        )
-
-    # staffing context
-    st.caption(
-        f"Forecast based on "
-        f"{total_doctors} total doctors"
-    )
-
-    st.subheader(
-        "Forecast Confidence"
-    )
-
-    st.subheader(
-        "Multi-Day Compartment Forecast"
-    )
-
-    selected_compartment = st.selectbox(
-        "Select Compartment",
-        [
-            "Intake",
-            "Waiting Room",
-            "Doctor",
-            "Pharmacy",
-            "Discharged"
-        ],
-        key="forecast_compartment"
-    )
-
-    compartment_map = {
-        "Intake": 0,
-        "Waiting Room": 1,
-        "Doctor": 2,
-        "Pharmacy": 3,
-        "Discharged": 4
-    }
-
-    st.pyplot(
-        visualizer.plot_multi_day_forecast(
-            summary,
-            compartment_index=compartment_map[
-                selected_compartment
-            ]
-        )
-    )
-
-
-# tab 4: settings
-with tab_settings:
-
-    st.subheader("Clinic Configuration")
-
-    settings = (
-        settings_service
-        .load_settings()
-    )
-
-    total_doctors = st.number_input(
-        "Total Doctors",
-        min_value=1,
-        value=settings["total_doctors"]
-    )
-
-    doctor_rooms = st.number_input(
-        "Doctor Rooms",
-        min_value=1,
-        value=settings["doctor_rooms"]
-    )
-
-    pharmacy_capacity = st.number_input(
-        "Pharmacy Capacity",
-        min_value=1,
-        value=settings["pharmacy_capacity"]
-    )
-
-    clinic_open_hour = st.number_input(
-        "Clinic Opening Hour",
-        min_value=0,
-        max_value=23,
-        value=settings["clinic_open_hour"]
-    )
-
-    clinic_close_hour = st.number_input(
-        "Clinic Closing Hour",
-        min_value=1,
-        max_value=24,
-        value=settings["clinic_close_hour"]
-    )
-
-    forecast_days = st.number_input(
-        "Forecast Days",
-        min_value=1,
-        max_value=30,
-        value=settings["forecast_days"]
-    )
-
-    if st.button("Save Settings"):
-
-        new_settings = {
-            "total_doctors": total_doctors,
-            "doctor_rooms": doctor_rooms,
-            "pharmacy_capacity": pharmacy_capacity,
-            "clinic_open_hour": clinic_open_hour,
-            "clinic_close_hour": clinic_close_hour,
-            "forecast_days": forecast_days
-        }
-
-        settings_service.save_settings(
-            new_settings
-        )
-
-        st.success(
-            "Settings updated."
-        )
-
-# tab 5: logs
 with tab_logs:
+    st.subheader("Event Log")
+    sheets = st.session_state.sheets
 
-    st.subheader("Event Logs")
+    if "ScanLog" not in sheets or sheets["ScanLog"].empty:
+        st.info("No events logged yet.")
+    else:
+        logs = sheets["ScanLog"].copy()
+        logs["timestamp"] = pd.to_datetime(logs["timestamp"], errors="coerce")
+        logs = logs.sort_values("timestamp", ascending=False)
+
+        # ── Summary metrics ───────────────────────────────────────────────
+        today = pd.Timestamp.now().normalize()
+        today_logs = logs[logs["timestamp"] >= today]
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total events",    len(logs))
+        m2.metric("Events today",    len(today_logs))
+        m3.metric(
+            "Scans today",
+            len(today_logs[today_logs["action"] == "SCAN_LOOKUP"]),
+        )
+        m4.metric(
+            "Moves today",
+            len(today_logs[today_logs["action"] == "MOVE_COMPARTMENT"]),
+        )
+
+        st.divider()
+
+        # FIX: single filterable dataframe instead of three separate
+        # st.dataframe calls with overlapping data.
+        ACTION_OPTIONS = ["All"] + sorted(logs["action"].dropna().unique().tolist())
+        filter_action = st.selectbox(
+            "Filter by action", ACTION_OPTIONS, key="log_filter"
+        )
+        date_range = st.date_input(
+            "Date range",
+            value=(today.date(), pd.Timestamp.now().date()),
+            key="log_dates",
+        )
+
+        filtered = logs.copy()
+        if filter_action != "All":
+            filtered = filtered[filtered["action"] == filter_action]
+        if len(date_range) == 2:
+            start, end = date_range
+            filtered = filtered[
+                (filtered["timestamp"].dt.date >= start)
+                & (filtered["timestamp"].dt.date <= end)
+            ]
+
+        st.caption(f"{len(filtered)} event(s) matching filter")
+        st.dataframe(
+            filtered.reset_index(drop=True),
+            use_container_width=True,
+            column_config={
+                "timestamp": st.column_config.DatetimeColumn(
+                    "Time", format="MMM D, YYYY · h:mm a"
+                ),
+                "action":       st.column_config.TextColumn("Action"),
+                "patient_uuid": st.column_config.TextColumn("Patient ID"),
+                "metadata":     st.column_config.TextColumn("Detail"),
+                "source":       st.column_config.TextColumn("Source"),
+            },
+        )
+
+        # Download button for audit export
+        csv = filtered.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Export filtered log as CSV",
+            data=csv,
+            file_name="caretrack_log_export.csv",
+            mime="text/csv",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 4 — PATIENT FLOW (compartment model)
+# ══════════════════════════════════════════════════════════════════════════
+
+with tab_flow:
+    st.subheader("Patient Flow Model")
+    st.caption(
+        "Daily forecast of patient volume through each area, derived from "
+        "historical movement data. Updates automatically as logs accumulate."
+    )
 
     sheets = st.session_state.sheets
 
-    if "ScanLog" in sheets:
-
-        logs = sheets["ScanLog"].sort_values("timestamp", ascending=False)
-
-        st.dataframe(logs)
-
-        st.subheader("Movement Events")
-
-        st.dataframe(
-            logs[logs["action"] == "MOVE_COMPARTMENT"]
+    if "ScanLog" not in sheets or sheets["ScanLog"].empty:
+        st.info(
+            "The flow model needs movement data to work. "
+            "Start scanning and moving patients — the model will populate here."
         )
+    else:
+        log_df = sheets["ScanLog"].copy()
 
-        st.subheader("Lookup Events")
+        # ── Model settings ────────────────────────────────────────────────
+        with st.expander("⚙️ Model settings", expanded=False):
+            lwbs_on = st.toggle(
+                "Account for patients who leave before being seen (LWBS)",
+                value=True,
+            )
+            if st.button("🔄 Recalculate now"):
+                st.cache_data.clear()
 
-        st.dataframe(
-            logs[logs["action"].isin(["SCAN_LOOKUP", "PATIENT_LOOKUP"])]
+        # ── Run solver ────────────────────────────────────────────────────
+        with st.spinner("Running flow model…"):
+            try:
+                params = extract_params(log_df, lwbs_enabled=lwbs_on)
+                y0     = get_current_occupancy(log_df)
+                sol    = solve(params, y0=y0)
+            except Exception as e:
+                st.error(f"Solver error: {e}")
+                st.stop()
+
+        if not sol.success:
+            st.error(f"Solver failed: {sol.message}")
+            st.stop()
+
+        # ── Summary metrics ───────────────────────────────────────────────
+        import numpy as np
+        total_expected = int(np.trapz(sol.lambda_t, sol.t))
+
+        def fmt_duration(mins):
+            if mins <= 0: return "—"
+            if mins < 60: return f"{mins:.0f} min"
+            return f"{int(mins//60)}h {int(mins%60)}m"
+
+        def fmt_hour(h):
+            from datetime import datetime, timedelta
+            t = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+            return (t + timedelta(hours=float(h))).strftime("%-I:%M %p")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Patients expected today", total_expected)
+        c2.metric("Avg time through clinic", fmt_duration(sol.mean_system_time * 60))
+        c3.metric("Predicted bottleneck", sol.bottleneck,
+                  delta=f"peaks ~{fmt_hour(sol.peak_waiting_hour)}", delta_color="off")
+
+        st.divider()
+
+        # ── Occupancy chart ───────────────────────────────────────────────
+        import plotly.graph_objects as go
+        from datetime import datetime, timedelta
+
+        base  = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+        times = [base + timedelta(hours=float(h)) for h in sol.t]
+
+        fig = go.Figure()
+        traces = [
+            ("Waiting room", sol.W, "#D97706", "rgba(217,119,6,0.2)"),
+            ("With doctor",  sol.D, "#2563EB", "rgba(37,99,235,0.2)"),
+            ("Pharmacy",     sol.P, "#7C3AED", "rgba(124,58,237,0.2)"),
+        ]
+        for name, y, line_col, fill_col in traces:
+            fig.add_trace(go.Scatter(
+                x=times, y=y, name=name,
+                fill="tozeroy",
+                line=dict(color=line_col, width=2),
+                fillcolor=fill_col,
+                hovertemplate="%{y:.1f} patients<extra>" + name + "</extra>",
+            ))
+
+        peak_time = base + timedelta(hours=float(sol.peak_waiting_hour))
+        fig.add_vline(
+            x=peak_time.isoformat(), line_dash="dot",
+            line_color="rgba(217,119,6,0.5)",
+            annotation_text=f"Peak waiting",
+            annotation_position="top right",
+            annotation_font_size=11,
         )
+        fig.update_layout(
+            xaxis_title="Time of day",
+            yaxis_title="Patients in area",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=0, r=0, t=30, b=0),
+            hovermode="x unified",
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            yaxis=dict(gridcolor="rgba(180,180,180,0.15)"),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ── Plain-language status cards ───────────────────────────────────
+        st.markdown("### Area status")
+
+        def area_card(name, occupancy_arr, rate, peak_hour=None):
+            peak      = float(np.max(occupancy_arr))
+            mean_occ  = float(np.mean(occupancy_arr))
+            ratio     = peak / mean_occ if mean_occ > 0 else 1
+            dwell_min = (1.0 / rate * 60) if rate > 0 else 0
+
+            if ratio < 1.8:
+                icon, msg = "🟢", "Flow looks steady throughout the day."
+            elif ratio < 2.8:
+                hour_str  = f" around **{fmt_hour(peak_hour)}**" if peak_hour else ""
+                icon, msg = "🟡", f"Moderate demand spike expected{hour_str}."
+            else:
+                hour_str  = f" near **{fmt_hour(peak_hour)}**" if peak_hour else ""
+                icon, msg = "🔴", f"High demand spike predicted{hour_str} — consider additional staffing."
+
+            return icon, name, msg, fmt_duration(dwell_min), peak
+
+        cards = [
+            area_card("Waiting room", sol.W, params.alpha,           sol.peak_waiting_hour),
+            area_card("Doctor area",  sol.D, params.beta+params.gamma, None),
+            area_card("Pharmacy",     sol.P, params.delta,           None),
+        ]
+        cc1, cc2, cc3 = st.columns(3)
+        for col, (icon, name, msg, dwell, peak) in zip([cc1, cc2, cc3], cards):
+            with col:
+                st.markdown(f"**{icon} {name}**")
+                st.markdown(msg)
+                st.caption(f"Avg dwell: **{dwell}** · Predicted peak: **{peak:.0f}** patients")
+
+        # ── Data quality note ─────────────────────────────────────────────
+        with st.expander("📋 Model data quality", expanded=False):
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.markdown(f"**Arrivals tracked:** {params.n_arrivals}")
+                st.markdown(f"**Waiting transitions:** {params.n_waiting_transitions}")
+                st.markdown(f"**Doctor transitions:** {params.n_doctor_transitions}")
+                st.markdown(f"**Pharmacy transitions:** {params.n_pharmacy_transitions}")
+            with col_b:
+                st.markdown(f"**Avg wait time:** {fmt_duration(params.mean_wait_min)}")
+                st.markdown(f"**Avg doctor visit:** {fmt_duration(params.mean_doctor_min)}")
+                st.markdown(f"**Avg pharmacy dwell:** {fmt_duration(params.mean_pharmacy_min)}")
+                st.markdown(f"**% routed to pharmacy:** {params.p_pharmacy*100:.0f}%")
+
+            log_df["timestamp"] = pd.to_datetime(log_df["timestamp"], errors="coerce")
+            days = max((log_df["timestamp"].max() - log_df["timestamp"].min()).days + 1, 1)
+            if days < 7:
+                st.warning(
+                    f"Only {days} day(s) of data — model accuracy will improve "
+                    "with more usage."
+                )
+            else:
+                st.success(f"Model trained on {days} days of movement data.")
