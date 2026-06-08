@@ -14,3 +14,7 @@ COMPARTMENTS = [
     "PHARMACY",
     "DISCHARGED"
 ]
+
+CLINIC_USERNAME = "caretrack"
+CLINIC_PASSWORD = "clinic2026"
+CLINIC_NAME     = "CareTrack Clinic"
