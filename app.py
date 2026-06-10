@@ -13,6 +13,7 @@ from services.compartment_params import extract_params
 from services.compartment_ode import solve, get_current_occupancy
 from rapidfuzz import process, fuzz
 from config import COMPARTMENTS, CLINIC_USERNAME, CLINIC_PASSWORD, CLINIC_NAME
+import plotly.graph_objects as go
 
 # ── Page config ────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -40,6 +41,8 @@ if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
 if "login_staff" not in st.session_state:
     st.session_state.login_staff = ""
+if "scan_timestamps" not in st.session_state:
+    st.session_state.scan_timestamps = {}
 
 if not st.session_state.logged_in:
     # Centre the login card with empty columns either side
@@ -65,9 +68,35 @@ backend      = ExcelBackend("data/mock_patients.xlsx")
 service      = PatientService(backend)
 scan_service = ScanService(backend)
 
+def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add any columns that downstream tabs expect but may not exist
+    in older versions of the spreadsheet. Safe to call on every load.
+    """
+    defaults = {
+        "insurance_status":   "Pending",
+        "insurance_provider": "",
+        "insurance_member_id": "",
+        "insurance_group":    "",
+        "insurance_plan":     "",
+        "current_medication": "",
+        "intake_date":        "",
+        "assigned_staff":     "",
+        "dob":                "",
+        "phone":              "",
+        "current_location":   "INTAKE",
+        "intake_source":      "",
+        "intake_notes":       "",
+    }
+    for col, default in defaults.items():
+        if col not in df.columns:
+            df[col] = default
+    return df
+
 # ── Session state bootstrap ───────────────────────────────────────────────
 if "df" not in st.session_state or "sheets" not in st.session_state:
     df, sheets = service.get_patients()
+    df = _ensure_columns(df)           # ← add this line
     st.session_state.df     = df
     st.session_state.sheets = sheets
 
@@ -86,6 +115,7 @@ if "dir_selected_patient" not in st.session_state:
 
 def refresh_state():
     df, sheets = service.get_patients()
+    df = _ensure_columns(df)
     st.session_state.df     = df
     st.session_state.sheets = sheets
 
@@ -302,13 +332,11 @@ with st.sidebar:
 st.title("🏥 CareTrack")
 st.caption("Clinical patient management · local build")
 
-tab_scan, tab_directory, tab_logs, tab_flow, tab_print, tab_new = st.tabs([
-    "🔍 Scan",
-    "👤 Directory",
-    "📜 Logs",
-    "📊 Patient Flow",
-    "🖨️ Print QR",
-    "🆕 Register Patient"
+tab_scan, tab_directory, tab_logs, tab_flow, \
+tab_print, tab_new, tab_board, tab_insurance, tab_eod = st.tabs([
+    "🔍 Scan", "👤 Directory", "📜 Logs", "📊 Patient Flow",
+    "🖨️ Print QR", "🆕 Register Patient", "🏥 Patient Board",
+    "🔒 Insurance", "📋 End of Day",
 ])
 
 
@@ -326,13 +354,30 @@ with tab_scan:
     scan_input = st.text_input("Scan or enter Patient ID", key="scan_input")
     df     = st.session_state.df
     sheets = st.session_state.sheets
+    DEBOUNCE_SECONDS = 10
 
     if scan_input:
         match = df[df["patient_uuid"] == scan_input]
         if len(match) > 0:
-            if st.session_state.get("active_patient") != scan_input:
-                st.session_state.active_patient = scan_input
+            now = datetime.now()
+            last_scan_time = st.session_state.scan_timestamps.get(scan_input)
+            seconds_since  = (
+                (now - last_scan_time).total_seconds()
+                if last_scan_time else DEBOUNCE_SECONDS + 1
+            )
+            is_new_scan = (
+                st.session_state.get("active_patient") != scan_input
+                or seconds_since > DEBOUNCE_SECONDS
+            )
+            if is_new_scan:
+                st.session_state.active_patient             = scan_input
+                st.session_state.scan_timestamps[scan_input] = now
                 log_event(scan_input, action="SCAN_LOOKUP", metadata="scan_tab")
+            elif seconds_since <= DEBOUNCE_SECONDS:
+                st.caption(
+                    f"⚡ Already scanned {int(seconds_since)}s ago — "
+                    f"showing record without re-logging."
+                )
         else:
             st.error(f"No patient found for ID: `{scan_input}`")
 
@@ -1006,3 +1051,503 @@ with tab_new:
                     )
             except Exception as e:
                 st.error(f"Failed to save patient: {e}")
+
+
+# ── Shared helper: compute dwell time per patient from ScanLog ─────────────
+# Used by both the board and the EOD report.
+ 
+def get_dwell_times(sheets: dict) -> dict:
+    """
+    For each patient_uuid, return how long (in minutes) they have been
+    in their current compartment, derived from the most recent
+    MOVE_COMPARTMENT event in ScanLog.
+    Returns {patient_uuid: minutes_in_current_location}.
+    """
+    if "ScanLog" not in sheets or sheets["ScanLog"].empty:
+        return {}
+    log = sheets["ScanLog"].copy()
+    log["timestamp"] = pd.to_datetime(log["timestamp"], errors="coerce")
+    moves = log[log["action"] == "MOVE_COMPARTMENT"].dropna(subset=["timestamp"])
+    if moves.empty:
+        return {}
+    latest = (
+        moves.sort_values("timestamp")
+             .groupby("patient_uuid")
+             .last()
+             .reset_index()[["patient_uuid", "timestamp"]]
+    )
+    now = pd.Timestamp.now()
+    latest["minutes"] = (now - latest["timestamp"]).dt.total_seconds() / 60
+    return dict(zip(latest["patient_uuid"], latest["minutes"].round(0)))
+ 
+ 
+def fmt_dwell(minutes: float) -> str:
+    if minutes < 1:
+        return "just arrived"
+    if minutes < 60:
+        return f"{int(minutes)}m"
+    h, m = int(minutes // 60), int(minutes % 60)
+    return f"{h}h {m}m" if m else f"{h}h"
+ 
+ 
+def dwell_colour(minutes: float, compartment: str) -> str:
+    """Traffic-light colouring based on expected dwell per compartment."""
+    thresholds = {
+        "INTAKE":     (15, 30),
+        "WAITING":    (30, 60),
+        "DOCTOR":     (20, 45),
+        "PHARMACY":   (10, 25),
+        "DISCHARGED": (0,  0),
+    }
+    warn, crit = thresholds.get(compartment.upper(), (30, 60))
+    if minutes <= warn:  return "#16A34A"   # green
+    if minutes <= crit:  return "#D97706"   # amber
+    return "#DC2626"                        # red
+ 
+ 
+# ══════════════════════════════════════════════════════════════════════════
+# TAB — LIVE PATIENT BOARD
+# ══════════════════════════════════════════════════════════════════════════
+ 
+with tab_board:
+    st.subheader("Live Patient Board")
+    st.caption(
+        "Real-time snapshot of every active patient by location. "
+        "Dwell time colours: 🟢 on track · 🟡 watch · 🔴 overdue."
+    )
+ 
+    # Manual refresh + auto-refresh toggle
+    bcol1, bcol2, bcol3 = st.columns([1, 1, 4])
+    with bcol1:
+        if st.button("🔄 Refresh", key="board_refresh"):
+            refresh_state()
+            st.rerun()
+    with bcol2:
+        show_discharged = st.toggle("Show discharged", value=False, key="board_discharged")
+ 
+    df     = st.session_state.df
+    sheets = st.session_state.sheets
+    dwells = get_dwell_times(sheets)
+ 
+    from config import COMPARTMENTS
+    display_comps = COMPARTMENTS if show_discharged else [
+        c for c in COMPARTMENTS if c != "DISCHARGED"
+    ]
+ 
+    # Build one column per compartment
+    board_cols = st.columns(len(display_comps))
+ 
+    for col, comp in zip(board_cols, display_comps):
+        comp_patients = df[
+            df["current_location"].astype(str).str.upper() == comp.upper()
+        ]
+        badge_colour = {
+            "INTAKE":     "#6B7280",
+            "WAITING":    "#D97706",
+            "DOCTOR":     "#2563EB",
+            "PHARMACY":   "#7C3AED",
+            "DISCHARGED": "#16A34A",
+        }.get(comp.upper(), "#6B7280")
+ 
+        with col:
+            # Compartment header with patient count pill
+            st.markdown(
+                f'<div style="background:{badge_colour};color:#fff;'
+                f'padding:6px 12px;border-radius:8px;font-weight:600;'
+                f'font-size:13px;margin-bottom:8px;text-align:center;">'
+                f'{comp} &nbsp;'
+                f'<span style="background:rgba(255,255,255,0.25);'
+                f'padding:1px 8px;border-radius:12px;font-size:12px;">'
+                f'{len(comp_patients)}</span></div>',
+                unsafe_allow_html=True,
+            )
+ 
+            if comp_patients.empty:
+                st.markdown(
+                    '<p style="color:#9CA3AF;font-size:12px;text-align:center;'
+                    'margin-top:12px;">No patients</p>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                for _, p in comp_patients.iterrows():
+                    pid      = p.get("patient_uuid", "")
+                    name     = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+                    dob      = p.get("dob", "—")
+                    ins      = str(p.get("insurance_status", "")).upper()
+                    ins_flag = " ⚠️" if ins in ("ISSUE", "HOLD", "EXPIRED") else ""
+                    minutes  = dwells.get(pid, 0)
+                    dc       = dwell_colour(minutes, comp)
+                    dwell_str = fmt_dwell(minutes)
+ 
+                    # Patient card
+                    st.markdown(
+                        f'<div style="border:1px solid #E5E7EB;border-radius:8px;'
+                        f'padding:10px 12px;margin-bottom:8px;background:#FAFAFA;">'
+                        f'<div style="font-weight:600;font-size:13px;">'
+                        f'{name}{ins_flag}</div>'
+                        f'<div style="font-size:11px;color:#6B7280;margin-top:2px;">'
+                        f'DOB: {dob}</div>'
+                        f'<div style="font-size:11px;color:#6B7280;">'
+                        f'ID: {pid}</div>'
+                        f'<div style="margin-top:6px;font-size:12px;font-weight:500;'
+                        f'color:{dc};">⏱ {dwell_str}</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+ 
+    st.divider()
+ 
+    # ── Board summary metrics ─────────────────────────────────────────────
+    active = df[df["current_location"].astype(str).str.upper() != "DISCHARGED"]
+    sm1, sm2, sm3, sm4 = st.columns(4)
+    sm1.metric("Total active patients", len(active))
+    sm2.metric("In waiting room", len(df[df["current_location"].astype(str).str.upper() == "WAITING"]))
+    sm3.metric("With doctor",     len(df[df["current_location"].astype(str).str.upper() == "DOCTOR"]))
+    sm4.metric("In pharmacy",     len(df[df["current_location"].astype(str).str.upper() == "PHARMACY"]))
+ 
+    # Flag anyone overdue in waiting (> 60 min)
+    overdue = [
+        f"{row['first_name']} {row['last_name']} ({fmt_dwell(dwells.get(row['patient_uuid'], 0))})"
+        for _, row in df[df["current_location"].astype(str).str.upper() == "WAITING"].iterrows()
+        if dwells.get(row["patient_uuid"], 0) > 60
+    ]
+    if overdue:
+        st.warning(
+            f"⏰ **{len(overdue)} patient(s) waiting over 60 minutes:** "
+            + " · ".join(overdue)
+        )
+ 
+ 
+# ══════════════════════════════════════════════════════════════════════════
+# TAB — INSURANCE ISSUES
+# ══════════════════════════════════════════════════════════════════════════
+ 
+with tab_insurance:
+    st.subheader("Insurance Issues")
+    st.caption(
+        "Patients with unresolved insurance flags. Sorted by urgency. "
+        "Use the notes field to log follow-up actions."
+    )
+ 
+    df     = st.session_state.df
+    sheets = st.session_state.sheets
+ 
+    # Pull flagged patients
+    flagged = df[
+        df["insurance_status"].astype(str).str.upper().isin(
+            ["ISSUE", "HOLD", "EXPIRED", "PENDING"]
+        )
+    ].copy()
+ 
+    if flagged.empty:
+        st.success("✅ No insurance issues on file.")
+    else:
+        # Compute days since intake
+        flagged["intake_date_parsed"] = pd.to_datetime(
+            flagged["intake_date"], errors="coerce"
+        )
+        flagged["days_pending"] = (
+            pd.Timestamp.now() - flagged["intake_date_parsed"]
+        ).dt.days.fillna(0).astype(int)
+ 
+        # Sort: ISSUE/HOLD/EXPIRED first, then PENDING; within each group by days desc
+        priority_order = {"ISSUE": 0, "HOLD": 0, "EXPIRED": 0, "PENDING": 1}
+        flagged["_priority"] = (
+            flagged["insurance_status"].astype(str).str.upper()
+                   .map(priority_order).fillna(2)
+        )
+        flagged = flagged.sort_values(["_priority", "days_pending"], ascending=[True, False])
+ 
+        # Summary strip
+        ic1, ic2, ic3 = st.columns(3)
+        hard_holds = flagged[flagged["insurance_status"].astype(str).str.upper()
+                             .isin(["ISSUE", "HOLD", "EXPIRED"])]
+        ic1.metric("Total flagged",  len(flagged))
+        ic2.metric("Hard holds",     len(hard_holds),
+                   delta="dispense blocked" if len(hard_holds) else None,
+                   delta_color="inverse")
+        ic3.metric("Pending review", len(flagged) - len(hard_holds))
+ 
+        st.divider()
+ 
+        # ── Per-patient rows ──────────────────────────────────────────────
+        for _, p in flagged.iterrows():
+            pid      = p.get("patient_uuid", "")
+            name     = f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+            status   = str(p.get("insurance_status", "")).upper()
+            provider = p.get("insurance_provider", "—")
+            member   = p.get("insurance_member_id", "—")
+            days     = int(p.get("days_pending", 0))
+            loc      = str(p.get("current_location", "—"))
+ 
+            is_hard  = status in ("ISSUE", "HOLD", "EXPIRED")
+            row_bg   = "#000000" if is_hard else "#FFFBEB"
+            status_colour = "#DC2626" if is_hard else "#D97706"
+ 
+            with st.container():
+                st.markdown(
+                    f'<div style="background:{row_bg};border-radius:8px;'
+                    f'padding:12px 16px;margin-bottom:4px;">'
+                    f'<span style="font-weight:600;font-size:14px;">{name}</span>'
+                    f'&nbsp;&nbsp;'
+                    f'<span style="background:{status_colour};color:#fff;'
+                    f'padding:2px 8px;border-radius:12px;font-size:11px;'
+                    f'font-weight:600;">{status}</span>'
+                    f'&nbsp;&nbsp;'
+                    f'<span style="font-size:12px;color:#6B7280;">'
+                    f'{provider} · Member: {member} · Currently: {loc} · '
+                    f'{days}d pending</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+ 
+                note_col, btn_col = st.columns([4, 1])
+                with note_col:
+                    note = st.text_input(
+                        "Follow-up note",
+                        key=f"ins_note_{pid}",
+                        placeholder="e.g. Called Aetna re: auth renewal — awaiting callback",
+                        label_visibility="collapsed",
+                    )
+                with btn_col:
+                    if st.button("Log note", key=f"ins_log_{pid}"):
+                        if note.strip():
+                            log_event(pid, action="INSURANCE_NOTE", metadata=note.strip())
+                            st.success("Note logged.")
+                        else:
+                            st.warning("Enter a note first.")
+ 
+                # Show prior notes from ScanLog
+                if "ScanLog" in sheets and not sheets["ScanLog"].empty:
+                    prior_notes = sheets["ScanLog"][
+                        (sheets["ScanLog"]["patient_uuid"] == pid)
+                        & (sheets["ScanLog"]["action"] == "INSURANCE_NOTE")
+                    ].copy()
+                    if not prior_notes.empty:
+                        prior_notes["timestamp"] = pd.to_datetime(
+                            prior_notes["timestamp"], errors="coerce"
+                        )
+                        prior_notes = prior_notes.sort_values("timestamp", ascending=False)
+                        with st.expander(f"Prior notes ({len(prior_notes)})", expanded=False):
+                            for _, n in prior_notes.iterrows():
+                                ts  = n["timestamp"].strftime("%-m/%-d · %-I:%M %p") \
+                                      if pd.notna(n["timestamp"]) else "—"
+                                src = n.get("source", "—")
+                                st.markdown(
+                                    f'<div style="font-size:12px;padding:4px 0;'
+                                    f'border-bottom:1px solid #E5E7EB;">'
+                                    f'<span style="color:#6B7280;">{ts} · {src}</span><br>'
+                                    f'{n.get("metadata","")}</div>',
+                                    unsafe_allow_html=True,
+                                )
+ 
+                st.markdown("")  # spacer
+ 
+ 
+# ══════════════════════════════════════════════════════════════════════════
+# TAB — END OF DAY REPORT
+# ══════════════════════════════════════════════════════════════════════════
+ 
+with tab_eod:
+    st.subheader("End of Day Report")
+    st.caption("Summary of today's activity. Export as CSV or print for handoff.")
+ 
+    sheets = st.session_state.sheets
+    df     = st.session_state.df
+ 
+    # Date picker — defaults to today, but allows reviewing past days
+    report_date = st.date_input(
+        "Report date", value=datetime.now().date(), key="eod_date"
+    )
+    day_start = pd.Timestamp(report_date)
+    day_end   = day_start + timedelta(days=1)
+ 
+    if "ScanLog" not in sheets or sheets["ScanLog"].empty:
+        st.info("No log data available yet.")
+    else:
+        log = sheets["ScanLog"].copy()
+        log["timestamp"] = pd.to_datetime(log["timestamp"], errors="coerce")
+        today_log = log[
+            (log["timestamp"] >= day_start) & (log["timestamp"] < day_end)
+        ]
+ 
+        # ── Headline metrics ──────────────────────────────────────────────
+        patients_seen  = today_log["patient_uuid"].nunique()
+        new_registered = len(today_log[today_log["action"] == "PATIENT_CREATED"])
+        dispenses      = len(today_log[today_log["action"] == "DISPENSE_CONFIRMED"])
+        ins_notes      = len(today_log[today_log["action"] == "INSURANCE_NOTE"])
+        moves          = len(today_log[today_log["action"] == "MOVE_COMPARTMENT"])
+ 
+        em1, em2, em3, em4, em5 = st.columns(5)
+        em1.metric("Patients seen",       patients_seen)
+        em2.metric("New registrations",   new_registered)
+        em3.metric("Meds dispensed",      dispenses)
+        em4.metric("Compartment moves",   moves)
+        em5.metric("Insurance follow-ups", ins_notes)
+ 
+        st.divider()
+ 
+        # ── Avg dwell time per compartment ────────────────────────────────
+        st.markdown("#### Average dwell times")
+        st.caption("Time spent in each area, based on today's movement events.")
+ 
+        move_log = today_log[today_log["action"] == "MOVE_COMPARTMENT"].copy()
+        move_log["metadata"] = move_log["metadata"].astype(str).str.upper().str.strip()
+        move_log = move_log.sort_values(["patient_uuid", "timestamp"])
+        move_log["prev_ts"]   = move_log.groupby("patient_uuid")["timestamp"].shift(1)
+        move_log["prev_comp"] = move_log.groupby("patient_uuid")["metadata"].shift(1)
+        move_log["dwell_min"] = (
+            move_log["timestamp"] - move_log["prev_ts"]
+        ).dt.total_seconds() / 60
+        move_log = move_log[
+            (move_log["dwell_min"] > 0) & (move_log["dwell_min"] < 480)
+        ]
+ 
+        from config import COMPARTMENTS
+        dwell_summary = []
+        for comp in COMPARTMENTS:
+            comp_rows = move_log[move_log["prev_comp"] == comp.upper()]
+            if not comp_rows.empty:
+                avg = comp_rows["dwell_min"].mean()
+                mx  = comp_rows["dwell_min"].max()
+                n   = len(comp_rows)
+                dwell_summary.append({
+                    "Compartment": comp,
+                    "Avg dwell":   f"{avg:.0f} min",
+                    "Max dwell":   f"{mx:.0f} min",
+                    "Transitions": n,
+                })
+ 
+        if dwell_summary:
+            st.dataframe(
+                pd.DataFrame(dwell_summary),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No compartment movement data for this date.")
+ 
+        st.divider()
+ 
+        # ── Dispense log ──────────────────────────────────────────────────
+        st.markdown("#### Medications dispensed")
+        dispense_rows = today_log[today_log["action"] == "DISPENSE_CONFIRMED"].copy()
+        if dispense_rows.empty:
+            st.info("No dispenses recorded today.")
+        else:
+            dispense_rows["timestamp"] = dispense_rows["timestamp"].dt.strftime(
+                "%-I:%M %p"
+            )
+            # Enrich with patient name
+            dispense_rows = dispense_rows.merge(
+                df[["patient_uuid", "first_name", "last_name"]],
+                on="patient_uuid", how="left",
+            )
+            dispense_rows["Patient"] = (
+                dispense_rows["first_name"].fillna("") + " "
+                + dispense_rows["last_name"].fillna("")
+            ).str.strip()
+            st.dataframe(
+                dispense_rows[["timestamp", "Patient", "patient_uuid", "metadata", "source"]]
+                    .rename(columns={
+                        "timestamp":    "Time",
+                        "patient_uuid": "Patient ID",
+                        "metadata":     "Medication / notes",
+                        "source":       "Staff",
+                    }),
+                use_container_width=True,
+                hide_index=True,
+            )
+ 
+        st.divider()
+ 
+        # ── Still-active patients (not yet discharged) ────────────────────
+        st.markdown("#### Patients still in system")
+        still_in = df[
+            df["current_location"].astype(str).str.upper() != "DISCHARGED"
+        ][["first_name", "last_name", "patient_uuid", "current_location",
+           "insurance_status"]]
+ 
+        if still_in.empty:
+            st.success("All patients discharged.")
+        else:
+            still_in["Name"] = (
+                still_in["first_name"].fillna("") + " "
+                + still_in["last_name"].fillna("")
+            ).str.strip()
+            st.dataframe(
+                still_in[["Name", "patient_uuid", "current_location", "insurance_status"]]
+                    .rename(columns={
+                        "patient_uuid":      "ID",
+                        "current_location":  "Location",
+                        "insurance_status":  "Insurance",
+                    }),
+                use_container_width=True,
+                hide_index=True,
+            )
+ 
+        st.divider()
+ 
+        # ── Exports ───────────────────────────────────────────────────────
+        st.markdown("#### Export")
+        exp1, exp2 = st.columns(2)
+ 
+        with exp1:
+            csv_data = today_log.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download full day log (CSV)",
+                data=csv_data,
+                file_name=f"caretrack_eod_{report_date}.csv",
+                mime="text/csv",
+                key="eod_csv",
+            )
+ 
+        with exp2:
+            # Printable HTML summary
+            dwell_rows_html = "".join(
+                f"<tr><td>{r['Compartment']}</td><td>{r['Avg dwell']}</td>"
+                f"<td>{r['Max dwell']}</td><td>{r['Transitions']}</td></tr>"
+                for r in dwell_summary
+            ) if dwell_summary else "<tr><td colspan='4'>No data</td></tr>"
+ 
+            still_in_html = "".join(
+                f"<tr><td>{r['Name']}</td><td>{r['patient_uuid']}</td>"
+                f"<td>{r['current_location']}</td></tr>"
+                for _, r in still_in.iterrows()
+            ) if not still_in.empty else "<tr><td colspan='3'>All discharged</td></tr>"
+ 
+            print_report = f"""<!DOCTYPE html><html><head>
+            <style>
+              body{{font-family:Arial,sans-serif;padding:32px;color:#111;max-width:800px;margin:auto}}
+              h1{{font-size:20px;margin-bottom:4px}} .sub{{color:#6B7280;font-size:13px;margin-bottom:24px}}
+              h2{{font-size:15px;margin:24px 0 8px;border-bottom:1px solid #E5E7EB;padding-bottom:4px}}
+              .metrics{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:8px}}
+              .metric{{border:1px solid #E5E7EB;border-radius:8px;padding:10px 12px}}
+              .metric-val{{font-size:22px;font-weight:700}} .metric-lbl{{font-size:11px;color:#6B7280}}
+              table{{width:100%;border-collapse:collapse;font-size:12px;margin-top:4px}}
+              th{{background:#F3F4F6;padding:6px 10px;text-align:left;font-size:11px}}
+              td{{padding:6px 10px;border-bottom:1px solid #F3F4F6}}
+              .print-btn{{margin-top:24px;padding:10px 28px;background:#2563EB;color:#fff;
+                border:none;border-radius:6px;font-size:14px;cursor:pointer}}
+              @media print{{.print-btn{{display:none}}}}
+            </style></head><body>
+            <h1>CareTrack · End of Day Report</h1>
+            <div class="sub">{report_date.strftime('%B %-d, %Y')} · Generated {datetime.now().strftime('%-I:%M %p')}</div>
+            <div class="metrics">
+              <div class="metric"><div class="metric-val">{patients_seen}</div><div class="metric-lbl">Patients seen</div></div>
+              <div class="metric"><div class="metric-val">{new_registered}</div><div class="metric-lbl">New registrations</div></div>
+              <div class="metric"><div class="metric-val">{dispenses}</div><div class="metric-lbl">Meds dispensed</div></div>
+              <div class="metric"><div class="metric-val">{moves}</div><div class="metric-lbl">Compartment moves</div></div>
+              <div class="metric"><div class="metric-val">{ins_notes}</div><div class="metric-lbl">Insurance follow-ups</div></div>
+            </div>
+            <h2>Average dwell times</h2>
+            <table><tr><th>Compartment</th><th>Avg</th><th>Max</th><th>Transitions</th></tr>
+            {dwell_rows_html}</table>
+            <h2>Patients still in system</h2>
+            <table><tr><th>Name</th><th>ID</th><th>Location</th></tr>
+            {still_in_html}</table>
+            <button class="print-btn" onclick="window.print()">🖨️ Print report</button>
+            </body></html>"""
+ 
+            if st.button("🖨️ Open printable report", key="eod_print"):
+                components.html(print_report, height=600, scrolling=True)
