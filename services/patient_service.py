@@ -51,3 +51,13 @@ class PatientService:
         sheets["Patients"] = df
 
         return sheets
+    
+    def add_patient(self, sheets: dict, new_row: dict) -> dict:
+        """Append a new patient row to the Patients sheet."""
+        import pandas as pd
+        new_df  = pd.DataFrame([new_row])
+        pat_key = next(k for k in sheets if "patient" in k.lower())
+        sheets[pat_key] = pd.concat(
+            [sheets[pat_key], new_df], ignore_index=True
+        )
+        return sheets

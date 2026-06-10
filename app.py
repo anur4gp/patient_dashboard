@@ -302,12 +302,13 @@ with st.sidebar:
 st.title("🏥 CareTrack")
 st.caption("Clinical patient management · local build")
 
-tab_scan, tab_directory, tab_logs, tab_flow, tab_print = st.tabs([
+tab_scan, tab_directory, tab_logs, tab_flow, tab_print, tab_new = st.tabs([
     "🔍 Scan",
     "👤 Directory",
     "📜 Logs",
     "📊 Patient Flow",
     "🖨️ Print QR",
+    "🆕 Register Patient"
 ])
 
 
@@ -801,3 +802,207 @@ with tab_print:
             "💡 Tip: in your browser print dialog, set margins to 'None' or 'Minimum' "
             "and disable headers/footers for a clean label."
         )
+
+# ══════════════════════════════════════════════════════════════════════════
+# TAB 6 — REGISTER NEW PATIENT
+# ══════════════════════════════════════════════════════════════════════════
+
+with tab_new:
+    st.subheader("Register New Patient")
+    st.caption(
+        "Fill in the fields below and click Register. A unique ID and QR label "
+        "will be generated automatically. Fields marked * are required."
+    )
+
+    df = st.session_state.df
+
+    # ── Live duplicate check (outside the form so it updates on each keystroke) ──
+    st.markdown("#### Check for existing record")
+    dup_first = st.text_input("First name *", key="new_first")
+    dup_last  = st.text_input("Last name *",  key="new_last")
+    dup_dob   = st.text_input(
+        "Date of birth * (MM/DD/YYYY)", key="new_dob", placeholder="03/14/1987"
+    )
+
+    duplicate_found = False
+    if dup_first and dup_last and dup_dob:
+        existing = df[
+            (df["first_name"].astype(str).str.lower().str.strip() == dup_first.lower().strip())
+            & (df["last_name"].astype(str).str.lower().str.strip() == dup_last.lower().strip())
+            & (df["dob"].astype(str).str.strip() == dup_dob.strip())
+        ]
+        if not existing.empty:
+            duplicate_found = True
+            dup_row = existing.iloc[0]
+            st.warning(
+                f"⚠️ **{dup_first.strip()} {dup_last.strip()}** (DOB {dup_dob}) already exists — "
+                f"ID: `{dup_row['patient_uuid']}`, "
+                f"currently in **{dup_row.get('current_location', '—')}**. "
+                f"Open their record in the Directory tab instead of creating a duplicate."
+            )
+        else:
+            st.success("No existing record found — safe to register.")
+
+    st.divider()
+
+    # ── Registration form ─────────────────────────────────────────────────
+    # Every widget inside st.form MUST have an explicit key= that is unique
+    # across the entire app — Streamlit auto-generates IDs from (label, placeholder)
+    # so two fields with the same label (e.g. two "Phone" inputs) will collide
+    # unless keyed explicitly.
+    with st.form("new_patient_form", clear_on_submit=True):
+
+        st.markdown("#### Demographics")
+        fc1, fc2 = st.columns(2)
+        first_name = fc1.text_input("First name *",  key="form_first", value=dup_first)
+        last_name  = fc2.text_input("Last name *",   key="form_last",  value=dup_last)
+
+        fd1, fd2, fd3 = st.columns(3)
+        dob      = fd1.text_input("Date of birth * (MM/DD/YYYY)", key="form_dob",      value=dup_dob)
+        gender   = fd2.selectbox("Gender", key="form_gender",
+                                 options=["", "Female", "Male", "Non-binary",
+                                          "Prefer not to say", "Other"])
+        pronouns = fd3.text_input("Pronouns", key="form_pronouns",
+                                  placeholder="she/her · he/him · they/them")
+
+        fe1, fe2 = st.columns(2)
+        ethnicity = fe1.selectbox("Race / Ethnicity", key="form_ethnicity", options=[
+            "", "Hispanic or Latino", "Black or African American", "White", "Asian",
+            "Middle Eastern", "Native Hawaiian or Pacific Islander",
+            "American Indian or Alaska Native", "Two or more races",
+            "Prefer not to say", "Other",
+        ])
+        # Key distinguishes this from the EC phone field below
+        pt_phone = fe2.text_input("Patient phone", key="form_pt_phone",
+                                  placeholder="(916) 555-0100")
+
+        ff1, ff2 = st.columns(2)
+        alt_phone = ff1.text_input("Alt phone", key="form_alt_phone", placeholder="optional")
+        email     = ff2.text_input("Email",     key="form_email",     placeholder="optional")
+
+        fg1, fg2, fg3, fg4 = st.columns([3, 2, 1, 1])
+        address  = fg1.text_input("Address",  key="form_address",  placeholder="412 Oak St")
+        city     = fg2.text_input("City",     key="form_city",     placeholder="Sacramento")
+        state    = fg3.text_input("State",    key="form_state",    placeholder="CA", max_chars=2)
+        zip_code = fg4.text_input("ZIP",      key="form_zip",      placeholder="95814", max_chars=5)
+
+        st.markdown("#### Emergency contact")
+        fh1, fh2, fh3 = st.columns(3)
+        ec_name  = fh1.text_input("EC name",         key="form_ec_name",  placeholder="Full name")
+        ec_rel   = fh2.text_input("EC relationship", key="form_ec_rel",   placeholder="Spouse, Parent…")
+        ec_phone = fh3.text_input("EC phone",        key="form_ec_phone", placeholder="(916) 555-0100")
+
+        st.markdown("#### Insurance")
+        fi1, fi2, fi3 = st.columns(3)
+        ins_provider = fi1.text_input("Insurance provider", key="form_ins_provider",
+                                      placeholder="Blue Cross, Medicaid…")
+        ins_member   = fi2.text_input("Member ID",          key="form_ins_member",
+                                      placeholder="BCX-0000000")
+        ins_group    = fi3.text_input("Group number",       key="form_ins_group",
+                                      placeholder="GRP-00000")
+
+        fj1, fj2 = st.columns(2)
+        ins_plan   = fj1.selectbox("Plan type", key="form_ins_plan",
+                                   options=["", "PPO", "HMO", "EPO", "POS",
+                                            "Medicaid", "Medicare", "Other"])
+        ins_status = fj2.selectbox("Insurance status", key="form_ins_status",
+                                   options=["Verified", "Pending", "ISSUE", "HOLD"])
+
+        st.markdown("#### Intake")
+        fk1, fk2, fk3 = st.columns(3)
+        intake_source = fk1.selectbox("How did they come in? *", key="form_intake_source",
+                                      options=["", "Referral", "Walk-in", "Tabling",
+                                               "Online / Website", "Other"])
+        intake_date    = fk2.text_input("Intake date *", key="form_intake_date",
+                                        value=datetime.now().strftime("%m/%d/%Y"))
+        assigned_staff = fk3.text_input("Assigned staff", key="form_assigned_staff",
+                                        value=st.session_state.login_staff)
+
+        current_med = st.text_input(
+            "Current / initial medication", key="form_current_med",
+            placeholder="e.g. Metformin 500mg — leave blank if not yet prescribed",
+        )
+        intake_notes = st.text_area(
+            "Intake notes", key="form_intake_notes", height=100,
+            placeholder="Any initial observations, referral source details, flags…",
+        )
+
+        st.markdown("")
+        submitted = st.form_submit_button(
+            "✅ Register patient",
+            use_container_width=True,
+            disabled=duplicate_found,
+        )
+
+    # ── On submit (outside the form block) ────────────────────────────────
+    if submitted:
+        errors = []
+        if not first_name.strip():  errors.append("First name is required.")
+        if not last_name.strip():   errors.append("Last name is required.")
+        if not dob.strip():         errors.append("Date of birth is required.")
+        if not intake_source:       errors.append("Intake source is required.")
+
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            import uuid as _uuid
+            new_uuid = "PT-" + str(_uuid.uuid4())[:8].upper()
+
+            new_row = {
+                "patient_uuid":        new_uuid,
+                "first_name":          first_name.strip(),
+                "last_name":           last_name.strip(),
+                "dob":                 dob.strip(),
+                "gender":              gender,
+                "pronouns":            pronouns.strip(),
+                "race_ethnicity":      ethnicity,
+                "phone":               pt_phone.strip(),
+                "alt_phone":           alt_phone.strip(),
+                "email":               email.strip(),
+                "address":             address.strip(),
+                "city":                city.strip(),
+                "state":               state.strip().upper(),
+                "zip":                 zip_code.strip(),
+                "emergency_contact":   ec_name.strip(),
+                "ec_relationship":     ec_rel.strip(),
+                "ec_phone":            ec_phone.strip(),
+                "insurance_provider":  ins_provider.strip(),
+                "insurance_member_id": ins_member.strip(),
+                "insurance_group":     ins_group.strip(),
+                "insurance_plan":      ins_plan,
+                "insurance_status":    ins_status,
+                "intake_source":       intake_source,
+                "intake_date":         intake_date.strip(),
+                "assigned_staff":      assigned_staff.strip(),
+                "current_medication":  current_med.strip(),
+                "intake_notes":        intake_notes.strip(),
+                "current_location":    "INTAKE",
+            }
+
+            sheets = st.session_state.sheets
+            try:
+                sheets = service.add_patient(sheets, new_row)
+                backend.write_patients(sheets)
+                log_event(new_uuid, action="PATIENT_CREATED",
+                          metadata=f"source={intake_source}")
+                refresh_state()
+
+                st.success(
+                    f"✅ **{first_name.strip()} {last_name.strip()}** registered. "
+                    f"Patient ID: `{new_uuid}`"
+                )
+                qr_col, info_col = st.columns([1, 2])
+                with qr_col:
+                    qr = generate_qr(new_uuid)
+                    st.image(qr, width=160)
+                with info_col:
+                    st.markdown(f"**Name:** {first_name.strip()} {last_name.strip()}")
+                    st.markdown(f"**DOB:** {dob.strip()}")
+                    st.markdown(f"**ID:** `{new_uuid}`")
+                    st.markdown("**Location:** INTAKE")
+                    st.caption(
+                        "Head to the 🖨️ Print QR tab to print a label for this patient."
+                    )
+            except Exception as e:
+                st.error(f"Failed to save patient: {e}")
