@@ -23,7 +23,7 @@ print(p)
 ode = ClinicODESystem(
     rates=rates,
     pharmacy_probability=p,
-    doctors=4
+    total_doctors=4
 )
 
 solution = ode.solve(
