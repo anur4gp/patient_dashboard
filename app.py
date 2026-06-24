@@ -14,33 +14,56 @@ from services.event_log_service import EventLogService
 COMPARTMENTS = ["Intake", "Waiting", "Doctor", "Pharmacy", "Discharged"]
 DATA_PATH = "data/mock_patients.xlsx"
 
+COMPARTMENT_COLORS = {
+    "Intake":      "#4A90D9",
+    "Waiting":     "#E6A817",
+    "Doctor":      "#5BAD6F",
+    "Pharmacy":    "#9B6FD4",
+    "Discharged":  "#888888",
+}
+
 # ---------------------------------------------------------------------------
 # Init services
 # ---------------------------------------------------------------------------
 backend = ExcelBackend(DATA_PATH)
-service = PatientService(backend)
-event_log = EventLogService()  # writes to event_log.csv
+service  = PatientService(backend)
+event_log = EventLogService()
 
 # ---------------------------------------------------------------------------
 # Session state bootstrap
 # ---------------------------------------------------------------------------
 def _bootstrap():
-    df, sheets = service.get_patients()
-    st.session_state.df = df
-    # Assign anonymous tokens if not already present
+    df, _ = service.get_patients()
+    df = df.reset_index(drop=True)
     if "anon_token" not in df.columns:
-        df = df.reset_index(drop=True)
         df["anon_token"] = [f"Patient #{i+1}" for i in df.index]
-        st.session_state.df = df
-    # Ensure compartment column exists
-    if "compartment" not in st.session_state.df.columns:
-        st.session_state.df["compartment"] = COMPARTMENTS[0]
+    if "compartment" not in df.columns:
+        df["compartment"] = COMPARTMENTS[0]
+    st.session_state.df = df
 
 if "df" not in st.session_state:
     _bootstrap()
 
 def get_df() -> pd.DataFrame:
     return st.session_state.df
+
+# ---------------------------------------------------------------------------
+# Core action
+# ---------------------------------------------------------------------------
+def move_patient(token: str, new_compartment: str):
+    """
+    Move patient to new_compartment. Returns error string or None on success.
+    """
+    df = get_df()
+    idx = df.index[df["anon_token"] == token]
+    if idx.empty:
+        return "Patient not found."
+    old = df.at[idx[0], "compartment"]
+    if old == new_compartment:
+        return f"Already in {new_compartment}."
+    st.session_state.df.at[idx[0], "compartment"] = new_compartment
+    event_log.log_move(from_compartment=old, to_compartment=new_compartment)
+    return None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -62,8 +85,16 @@ def fuzzy_search(df: pd.DataFrame, query: str, limit: int = 10) -> pd.DataFrame:
     return pd.DataFrame(matched)
 
 
+def compartment_badge(compartment: str) -> str:
+    color = COMPARTMENT_COLORS.get(compartment, "#888")
+    return (
+        f'<span style="background:{color};color:#fff;padding:3px 10px;'
+        f'border-radius:12px;font-size:0.85em;font-weight:600;">'
+        f'{compartment}</span>'
+    )
+
+
 def render_patient_card(p: pd.Series):
-    """Full patient info card with QR — used in Scan and Directory tabs."""
     skip = {"full_name", "anon_token", "compartment"}
     col1, col2 = st.columns([4, 1])
     with col1:
@@ -71,29 +102,39 @@ def render_patient_card(p: pd.Series):
         for key, val in p.to_dict().items():
             if key in ("first_name", "last_name") or key in skip:
                 continue
-            str(key).replace('_', ' ').title()
+            st.markdown(f"**{str(key).replace('_', ' ').title()}:** {val}")
     with col2:
         qr = generate_qr(p["patient_uuid"])
         st.image(qr, caption="Patient QR", width=120)
 
 
-def move_patient(token: str, new_compartment: str):
-    """Move patient between compartments and log the event."""
-    df = get_df()
-    idx = df.index[df["anon_token"] == token]
-    if idx.empty:
-        return
-    old_compartment = df.at[idx[0], "compartment"]
-    if old_compartment == new_compartment:
-        return
-    st.session_state.df.at[idx[0], "compartment"] = new_compartment
-    event_log.log_move(
-        from_compartment=old_compartment,
-        to_compartment=new_compartment,
+def render_move_control(token: str, current_compartment: str):
+    """Compartment badge + inline move selector — used in Scan tab."""
+    st.markdown(
+        f"**Current location:** {compartment_badge(current_compartment)}",
+        unsafe_allow_html=True,
     )
+    st.write("")
+    options = [c for c in COMPARTMENTS if c != current_compartment]
+    col_sel, col_btn = st.columns([3, 1])
+    with col_sel:
+        dest = st.selectbox(
+            "Move to",
+            options=options,
+            key=f"move_dest_{token}",
+            label_visibility="collapsed",
+        )
+    with col_btn:
+        if st.button("Move →", key=f"move_btn_{token}", use_container_width=True):
+            err = move_patient(token, dest)
+            if err:
+                st.warning(err)
+            else:
+                st.success(f"Moved to {dest}")
+                st.rerun()
 
 # ---------------------------------------------------------------------------
-# Sidebar — event log download
+# Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("Event Log")
@@ -114,47 +155,54 @@ with st.sidebar:
 # Tabs
 # ---------------------------------------------------------------------------
 st.title("Patient Dashboard")
-tab_kanban, tab_scan, tab_directory = st.tabs(["🗂️ Board", "🔍 Scan", "👤 Directory"])
+tab_board, tab_scan, tab_directory = st.tabs(["🗂️ Board", "🔍 Scan", "👤 Directory"])
 
-# --- Kanban board (anonymous) ---
-with tab_kanban:
-    st.subheader("Patient Flow Board")
-
+# ---------------------------------------------------------------------------
+# Board — read-only flow summary
+# ---------------------------------------------------------------------------
+with tab_board:
+    st.subheader("Patient Flow Summary")
     df = get_df()
+
     cols = st.columns(len(COMPARTMENTS))
-
     for col, compartment in zip(cols, COMPARTMENTS):
+        count = int((df["compartment"] == compartment).sum())
+        color = COMPARTMENT_COLORS[compartment]
         with col:
-            st.markdown(f"**{compartment}**")
-            patients_here = df[df["compartment"] == compartment]["anon_token"].tolist()
-            st.caption(f"{len(patients_here)} patient(s)")
+            st.markdown(
+                f"""
+                <div style="
+                    background:{color}22;
+                    border:1.5px solid {color};
+                    border-radius:10px;
+                    padding:18px 10px;
+                    text-align:center;
+                ">
+                    <div style="color:{color};font-weight:700;font-size:1em;">
+                        {compartment}
+                    </div>
+                    <div style="font-size:2em;font-weight:800;margin-top:6px;">
+                        {count}
+                    </div>
+                    <div style="color:#aaa;font-size:0.78em;">patient(s)</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-            for token in patients_here:
-                with st.container(border=True):
-                    st.markdown(f"🪪 {token}")
-                    next_options = [c for c in COMPARTMENTS if c != compartment]
-                    dest = st.selectbox(
-                        "Move to",
-                        options=next_options,
-                        key=f"dest_{token}",
-                        label_visibility="collapsed",
-                    )
-                    if st.button("Move →", key=f"move_{token}"):
-                        move_patient(token, dest)
-                        st.rerun()
-
-    # Add a new anonymous patient to Intake
     st.divider()
+
+    # Add patient to Intake
     if st.button("➕ Add patient to Intake"):
         df = get_df()
         new_idx = len(df)
         new_token = f"Patient #{new_idx + 1}"
         new_row = pd.DataFrame([{
             "patient_uuid": f"anon-{new_idx}",
-            "first_name": "Unknown",
-            "last_name": "",
-            "anon_token": new_token,
-            "compartment": "Intake",
+            "first_name":   "Unknown",
+            "last_name":    "",
+            "anon_token":   new_token,
+            "compartment":  "Intake",
         }])
         st.session_state.df = pd.concat(
             [st.session_state.df, new_row], ignore_index=True
@@ -162,24 +210,32 @@ with tab_kanban:
         event_log.log_move(from_compartment="—", to_compartment="Intake")
         st.rerun()
 
-# --- QR scan lookup ---
+# ---------------------------------------------------------------------------
+# Scan — patient lookup + move control
+# ---------------------------------------------------------------------------
 with tab_scan:
-    st.subheader("Scan Patient QR")
+    st.subheader("Scan Patient")
     scan_input = st.text_input(
         "Patient UUID",
         key="scan_input",
         placeholder="Scan or paste patient UUID...",
     )
+
     df = get_df()
+
     if scan_input:
         match = df[df["patient_uuid"] == scan_input]
-        if not match.empty:
-            st.success("Patient found")
-            render_patient_card(match.iloc[0])
-        else:
+        if match.empty:
             st.error("No patient found with that ID.")
+        else:
+            p = match.iloc[0]
+            render_patient_card(p)
+            st.divider()
+            render_move_control(p["anon_token"], p["compartment"])
 
-# --- Directory ---
+# ---------------------------------------------------------------------------
+# Directory — fuzzy name search, read-only
+# ---------------------------------------------------------------------------
 with tab_directory:
     st.subheader("Patient Directory")
     query = st.text_input(
