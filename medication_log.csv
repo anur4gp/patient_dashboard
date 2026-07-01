@@ -1,0 +1,1 @@
+rx_id,patient_uuid,prescribed_at,drug_name,dose,route,frequency,notes,effectiveness,price_usd,prior_rx_id
