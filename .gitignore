@@ -14,3 +14,6 @@ data/mock_patients.xlsx
 
 # Mac files
 .DS_Store
+
+qr_codes/*.png
+temp_patient_label.html

@@ -290,52 +290,10 @@ with st.sidebar:
 # Tabs
 # ---------------------------------------------------------------------------
 st.title("Patient Dashboard")
-tab_board, tab_scan, tab_pharmacy, tab_directory = st.tabs(
-    ["🗂️ Board", "🔍 Scan", "💊 Pharmacy", "👤 Directory"]
+tab_scan, tab_pharmacy, tab_directory = st.tabs(
+    ["🔍 Scan", "💊 Pharmacy", "👤 Directory"]
 )
 
-# ---------------------------------------------------------------------------
-# Board — read-only flow summary
-# ---------------------------------------------------------------------------
-with tab_board:
-    st.subheader("Patient Flow Summary")
-    df = get_df()
-    cols = st.columns(len(COMPARTMENTS))
-    for col, compartment in zip(cols, COMPARTMENTS):
-        count = int((df["compartment"] == compartment).sum())
-        color = COMPARTMENT_COLORS[compartment]
-        with col:
-            st.markdown(
-                f"""
-                <div style="
-                    background:{color}22;border:1.5px solid {color};
-                    border-radius:10px;padding:18px 10px;text-align:center;">
-                    <div style="color:{color};font-weight:700;font-size:1em;">
-                        {compartment}</div>
-                    <div style="font-size:2em;font-weight:800;margin-top:6px;">
-                        {count}</div>
-                    <div style="color:#aaa;font-size:0.78em;">patient(s)</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-    st.divider()
-    if st.button("➕ Add patient to Intake"):
-        df = get_df()
-        new_idx = len(df)
-        new_token = f"Patient #{new_idx + 1}"
-        new_row = pd.DataFrame([{
-            "patient_uuid": f"anon-{new_idx}",
-            "first_name":   "Unknown",
-            "last_name":    "",
-            "anon_token":   new_token,
-            "compartment":  "Intake",
-        }])
-        st.session_state.df = pd.concat(
-            [st.session_state.df, new_row], ignore_index=True
-        )
-        event_log.log_move(from_compartment="—", to_compartment="Intake")
-        st.rerun()
 
 # ---------------------------------------------------------------------------
 # Scan — patient lookup + move
