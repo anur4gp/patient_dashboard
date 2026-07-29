@@ -17,3 +17,6 @@ data/mock_patients.xlsx
 
 qr_codes/*.png
 temp_patient_label.html
+
+# Local private key
+private_key.pem
