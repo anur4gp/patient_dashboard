@@ -1,20 +1,29 @@
-USE_MOCK_SHAREPOINT = False
+"""
+config.py
 
-TENANT_ID = "7b7c2e14-a91a-48d2-8db4-d069f14adee8"
-CLIENT_ID = "5e6c47bb-38d2-4734-8486-27ee21ead29f"
-CLIENT_SECRET = "Ev-8Q~RdRGbh1ZBzMM3b7Wk.2C~k.Qk9vTNmvbV-"
+Loads ECW credentials from a local .env file (see .env.example).
+Never commit a real .env — it's already covered by .gitignore below.
+"""
 
-SHAREPOINT_SITE_URL = ""
-FILE_PATH = ""
+from __future__ import annotations
 
-COMPARTMENTS = [
-    "INTAKE",
-    "WAITING",
-    "DOCTOR",
-    "PHARMACY",
-    "DISCHARGED"
-]
+import os
+from dotenv import load_dotenv
 
-CLINIC_USERNAME = "caretrack"
-CLINIC_PASSWORD = "clinic2026"
-CLINIC_NAME     = "CareTrack Clinic"
+load_dotenv()
+
+
+def _require(key: str) -> str:
+    value = os.environ.get(key)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable: {key}. "
+            f"Copy .env.example to .env and fill it in."
+        )
+    return value
+
+
+ECW_BASE_URL = _require("ECW_BASE_URL")
+ECW_CLIENT_ID = _require("ECW_CLIENT_ID")
+ECW_CLIENT_SECRET = _require("ECW_CLIENT_SECRET")
+ECW_TOKEN_URL = _require("ECW_TOKEN_URL")

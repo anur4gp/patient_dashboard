@@ -1,5 +1,0 @@
-Clinical patient data management software, used to connect devices over a local network into a dashboard derived from a Microsoft sharepoint excel file. All data used is synthetic.
-
-Connects Microsoft SharePoint .xlsx file to localized dashboard on Streamlit ( + Python) with Azure supported software. With a simple login gate, allows only authorized users to enter the dashboard (HCWs). Implements a scan system (using unique QR code generation per patient) that allows for a full description of the patients information to be displayed. Another tab allows for the look-up of any patient by name, accounting for rougher spelling and edge-cases. 3rd tab contains logs of lookup information, which will be pipelined to model patient center flow and help identify operational inconsistencies.
-
-Especially useful for HCWs looking to easily access patient data in a quick environment (Doctors, PTs, etc.) Compartment tracking allows for further analysis of patient 'heatmaps', essentially allowing for organizations to track their bottlenecks through rigorous usage of program and with constant patient tracking and updating.
