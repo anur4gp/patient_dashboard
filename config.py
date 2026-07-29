@@ -25,5 +25,6 @@ def _require(key: str) -> str:
 
 ECW_BASE_URL = _require("ECW_BASE_URL")
 ECW_CLIENT_ID = _require("ECW_CLIENT_ID")
-ECW_CLIENT_SECRET = _require("ECW_CLIENT_SECRET")
 ECW_TOKEN_URL = _require("ECW_TOKEN_URL")
+ECW_PRIVATE_KEY_PATH = _require("ECW_PRIVATE_KEY_PATH")
+ECW_KID = _require("ECW_KID")

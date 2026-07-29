@@ -30,8 +30,9 @@ st.title("Patient QR — ECW Lookup (Read Only)")
 client = ECWClient(
     base_url=config.ECW_BASE_URL,
     client_id=config.ECW_CLIENT_ID,
-    client_secret=config.ECW_CLIENT_SECRET,
     token_url=config.ECW_TOKEN_URL,
+    private_key_path=config.ECW_PRIVATE_KEY_PATH,
+    kid=config.ECW_KID,
 )
 
 tab_directory, tab_scan = st.tabs(["Directory", "Scan"])

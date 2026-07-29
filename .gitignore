@@ -1,22 +1,14 @@
-# Virtual environment
-venv/
-
-# Python cache
-__pycache__/
-*.pyc
-
-# Secrets / credentials
-auth_config.py
-.env
-
-# Local data
-data/mock_patients.xlsx
-
 # Mac files
 .DS_Store
 
-qr_codes/*.png
-temp_patient_label.html
-
 # Local private key
 private_key.pem
+
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+keys/
+*.pem
+!jwks.json

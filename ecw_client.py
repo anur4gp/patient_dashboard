@@ -15,18 +15,21 @@ Design notes
   code (per base URL). A simple token-bucket limiter is included
   so this client is safe to call from a live Streamlit session
   without needing to think about it at the call site.
-- Auth: OAuth 2.0 client-credentials (backend service) flow is
-  assumed, per ECW's provider-facing / backend FHIR API docs.
-  Swap `_fetch_access_token` if your ECW registration instead
-  requires the authorization_code / SMART launch flow.
+- Auth: SMART Backend Services (asymmetric client authentication,
+  RFC 7523 JWT-bearer client assertion) — this is what ECW's dev
+  portal expects once you register a JWKS URL instead of a client
+  secret. Each token request is authenticated with a short-lived
+  JWT signed by your private key; ECW verifies it against the
+  public key it fetched from your hosted jwks.json.
 
 Usage
 -----
     client = ECWClient(
         base_url="https://staging-fhir.ecwcloud.com/fhir/r4/FFBJCD",
         client_id=os.environ["ECW_CLIENT_ID"],
-        client_secret=os.environ["ECW_CLIENT_SECRET"],
         token_url="https://staging-oauthserver.ecwcloud.com/oauth/oauth2/token",
+        private_key_path=os.environ["ECW_PRIVATE_KEY_PATH"],
+        kid=os.environ["ECW_KID"],
     )
     patient = client.get_patient_by_id("U4AqQsgbW6hNV8HfIb2RTFL9i1K9X8ASlFdXtZ1Zcm4")
 """
@@ -34,9 +37,12 @@ Usage
 from __future__ import annotations
 
 import time
+import uuid
 import threading
 from dataclasses import dataclass, field
 from typing import Optional, Any
+
+import jwt as pyjwt  # PyJWT — pip install pyjwt cryptography
 
 import requests
 
@@ -111,15 +117,21 @@ class ECWClient:
         self,
         base_url: str,
         client_id: str,
-        client_secret: str,
         token_url: str,
+        private_key_path: str,
+        kid: str,
+        scope: str = "system/Patient.read",
         timeout_seconds: float = 15.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.client_id = client_id
-        self.client_secret = client_secret
         self.token_url = token_url
+        self.kid = kid
+        self.scope = scope
         self.timeout_seconds = timeout_seconds
+
+        with open(private_key_path, "rb") as f:
+            self._private_key_pem = f.read()
 
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -129,14 +141,37 @@ class ECWClient:
     # Auth
     # ------------------------------------------------------------------
 
+    def _build_client_assertion(self) -> str:
+        """Builds and signs the short-lived JWT that authenticates
+        this client to ECW's token endpoint, per SMART Backend
+        Services (RFC 7523). ECW verifies the signature using the
+        public key it fetched from your hosted jwks.json — matched
+        by the `kid` in this JWT's header."""
+        now = int(time.time())
+        claims = {
+            "iss": self.client_id,
+            "sub": self.client_id,
+            "aud": self.token_url,
+            "jti": str(uuid.uuid4()),
+            "iat": now,
+            "exp": now + 300,  # SMART spec: assertion must be short-lived (<=5 min)
+        }
+        return pyjwt.encode(
+            claims,
+            self._private_key_pem,
+            algorithm="RS384",
+            headers={"kid": self.kid, "typ": "JWT"},
+        )
+
     def _fetch_access_token(self) -> None:
+        client_assertion = self._build_client_assertion()
         resp = requests.post(
             self.token_url,
             data={
                 "grant_type": "client_credentials",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "scope": "system/Patient.read",
+                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion": client_assertion,
+                "scope": self.scope,
             },
             timeout=self.timeout_seconds,
         )
