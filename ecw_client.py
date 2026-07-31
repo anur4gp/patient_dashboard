@@ -188,6 +188,7 @@ class ECWClient:
     def _get_valid_token(self) -> str:
         if self._access_token is None or time.monotonic() >= self._token_expires_at:
             self._fetch_access_token()
+        assert self._access_token is not None
         return self._access_token
 
     # ------------------------------------------------------------------

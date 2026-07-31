@@ -18,6 +18,7 @@ import json
 from dataclasses import dataclass
 
 import qrcode
+from qrcode.constants import ERROR_CORRECT_M
 
 
 QR_PAYLOAD_VERSION = 1
@@ -45,7 +46,7 @@ def generate_patient_qr(ecw_patient_id: str) -> bytes:
 
     qr = qrcode.QRCode(
         version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        error_correction=ERROR_CORRECT_M,
         box_size=10,
         border=4,
     )
@@ -54,7 +55,9 @@ def generate_patient_qr(ecw_patient_id: str) -> bytes:
 
     img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    # qrcode's PilImage.save expects the image kind as the second arg (named `kind`),
+    # not `format`. Pass it as a keyword to avoid type errors from static checkers.
+    img.save(buf, kind="PNG")
     return buf.getvalue()
 
 
